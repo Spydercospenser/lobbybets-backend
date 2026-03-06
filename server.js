@@ -10,7 +10,7 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ==================== CORS CONFIGURATION ====================
+/// ==================== CORS CONFIGURATION ====================
 // Allow requests from multiple origins
 const allowedOrigins = [
   'http://localhost:8081',
@@ -27,17 +27,37 @@ const allowedOrigins = [
   'http://localhost:5001'
 ];
 
+// Add regex pattern for all expo.app subdomains
+const allowedOriginPatterns = [
+  /\.expo\.app$/,
+  /^https?:\/\/lobbybets-app--[a-z0-9]+\.expo\.app$/
+];
+
 const corsOptions = {
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps, curl, Postman)
     if (!origin) return callback(null, true);
     
-    if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== 'production') {
-      callback(null, true);
-    } else {
-      console.log('❌ Blocked origin:', origin);
-      callback(new Error('Not allowed by CORS'));
+    // Check if origin is in the explicit list
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      return callback(null, true);
     }
+    
+    // Check if origin matches any pattern
+    const matchesPattern = allowedOriginPatterns.some(pattern => pattern.test(origin));
+    if (matchesPattern) {
+      return callback(null, true);
+    }
+    
+    // Allow all origins in development
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('⚠️ Development mode - allowing origin:', origin);
+      return callback(null, true);
+    }
+    
+    // Block in production
+    console.log('❌ Blocked origin:', origin);
+    callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
