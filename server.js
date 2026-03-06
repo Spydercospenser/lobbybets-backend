@@ -83,9 +83,12 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Database connection
+// Database connection with SSL for Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false // Required for Render PostgreSQL
+  },
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
