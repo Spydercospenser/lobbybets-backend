@@ -10,6 +10,16 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 3000;
 
+// ==================== JWT DEBUG ====================
+console.log('🔑 ===== JWT DEBUG =====');
+console.log('🔑 JWT_SECRET loaded:', process.env.JWT_SECRET ? '✅ Yes' : '❌ No');
+console.log('🔑 JWT_SECRET length:', process.env.JWT_SECRET ? process.env.JWT_SECRET.length : 0);
+console.log('🔑 JWT_SECRET prefix:', process.env.JWT_SECRET ? process.env.JWT_SECRET.substring(0, 10) + '...' : 'N/A');
+console.log('🔑 JWT_EXPIRES_IN raw value:', process.env.JWT_EXPIRES_IN ? `"${process.env.JWT_EXPIRES_IN}"` : 'Not set');
+console.log('🔑 JWT_EXPIRES_IN type:', typeof process.env.JWT_EXPIRES_IN);
+console.log('🔑 JWT_EXPIRES_IN length:', process.env.JWT_EXPIRES_IN ? process.env.JWT_EXPIRES_IN.length : 0);
+console.log('🔑 ===================');
+
 /// ==================== CORS CONFIGURATION ====================
 // Allow requests from multiple origins
 const allowedOrigins = [
@@ -109,19 +119,110 @@ const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
   
+  console.log('🔐 Auth header received:', authHeader ? 'Yes' : 'No');
+  console.log('🔐 Auth header value:', authHeader ? authHeader.substring(0, 30) + '...' : 'None');
+  
   if (!token) {
+    console.log('❌ No token provided in request');
     return res.status(401).json({ error: 'Access denied. No token provided.' });
+  }
+  
+  console.log('🔑 Token received (first 30 chars):', token.substring(0, 30) + '...');
+  console.log('🔑 Token length:', token.length);
+  console.log('🔑 Token parts:', token.split('.').length);
+  
+  // Check if token has 3 parts (header.payload.signature)
+  const parts = token.split('.');
+  if (parts.length !== 3) {
+    console.error('❌ Token does not have 3 parts, has:', parts.length);
+    return res.status(403).json({ error: 'Invalid token format' });
+  }
+  
+  // Try to decode the payload without verification to see what's inside
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+    console.log('📦 Token payload (decoded):', {
+      userId: payload.userId,
+      phone: payload.phone ? 'present' : 'missing',
+      exp: payload.exp ? new Date(payload.exp * 1000).toLocaleString() : 'missing',
+      iat: payload.iat ? new Date(payload.iat * 1000).toLocaleString() : 'missing'
+    });
+    
+    // Check if token is expired
+    if (payload.exp) {
+      const now = Math.floor(Date.now() / 1000);
+      if (payload.exp < now) {
+        console.log('⏰ Token EXPIRED at:', new Date(payload.exp * 1000).toLocaleString());
+        console.log('⏰ Current time:', new Date().toLocaleString());
+      } else {
+        console.log('⏰ Token valid until:', new Date(payload.exp * 1000).toLocaleString());
+      }
+    }
+  } catch (decodeError) {
+    console.error('❌ Could not decode token payload:', decodeError.message);
   }
   
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) {
-      console.error('❌ Token verification failed:', err.message);
-      return res.status(403).json({ error: 'Invalid or expired token' });
+      console.error('❌ JWT Verification failed:');
+      console.error('   - Name:', err.name);
+      console.error('   - Message:', err.message);
+      
+      if (err.name === 'JsonWebTokenError') {
+        console.error('   - This usually means:');
+        console.error('     1. JWT_SECRET mismatch between server and client');
+        console.error('     2. Token was tampered with');
+        console.error('     3. Token was generated with a different secret');
+        return res.status(403).json({ error: 'Invalid token signature' });
+      } else if (err.name === 'TokenExpiredError') {
+        console.error('   - Token expired at:', err.expiredAt);
+        return res.status(403).json({ error: 'Token expired' });
+      } else {
+        return res.status(403).json({ error: 'Invalid or expired token' });
+      }
     }
+    
+    console.log('✅ Token verified successfully for user:', user.userId);
     req.user = user;
     next();
   });
 };
+
+// ==================== TEST JWT ENDPOINT ====================
+app.get('/api/test-jwt', (req, res) => {
+  try {
+    // Generate a test token
+    const expiresIn = process.env.JWT_EXPIRES_IN || '7d';
+    const testToken = jwt.sign(
+      { test: 'data', userId: 'test-user' },
+      process.env.JWT_SECRET,
+      { expiresIn: expiresIn }
+    );
+    
+    // Verify it immediately
+    const verified = jwt.verify(testToken, process.env.JWT_SECRET);
+    
+    // Decode to check expiration
+    const decoded = jwt.decode(testToken);
+    
+    res.json({
+      success: true,
+      message: 'JWT configuration is working',
+      secretPresent: !!process.env.JWT_SECRET,
+      secretLength: process.env.JWT_SECRET ? process.env.JWT_SECRET.length : 0,
+      expiresIn: expiresIn,
+      tokenGenerated: !!testToken,
+      tokenVerified: !!verified,
+      expiresAt: new Date(decoded.exp * 1000).toLocaleString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      secretPresent: !!process.env.JWT_SECRET
+    });
+  }
+});
 
 // ==================== HELPER FUNCTIONS ====================
 const generateReferralCode = () => {
@@ -133,6 +234,20 @@ const formatPhoneForMPesa = (phone) => {
   let cleaned = phone.replace(/[^0-9]/g, '');
   
   // Convert 07XX to 2547XX
+  if (cleaned.startsWith('0')) {
+    cleaned = '254' + cleaned.substring(1);
+  } else if (cleaned.startsWith('7')) {
+    cleaned = '254' + cleaned;
+  }
+  
+  return cleaned;
+};
+
+const normalizePhoneForDatabase = (phone) => {
+  // Remove all non-numeric characters
+  let cleaned = phone.replace(/[^0-9]/g, '');
+  
+  // If it starts with 0, replace with 254
   if (cleaned.startsWith('0')) {
     cleaned = '254' + cleaned.substring(1);
   }
@@ -186,10 +301,14 @@ app.post('/api/register', async (req, res) => {
       return res.status(400).json({ error: 'All fields are required' });
     }
     
+    // Normalize phone number for storage
+    const normalizedPhone = normalizePhoneForDatabase(phone);
+    console.log('📱 Normalized phone for storage:', normalizedPhone);
+    
     // Check if user already exists
     const existingUser = await pool.query(
       'SELECT id FROM profiles WHERE phone = $1 OR email = $2',
-      [phone, email]
+      [normalizedPhone, email]
     );
     
     if (existingUser.rows.length > 0) {
@@ -207,7 +326,7 @@ app.post('/api/register', async (req, res) => {
       `INSERT INTO profiles (phone, full_name, email, age, referral_code, password_hash) 
        VALUES ($1, $2, $3, $4, $5, $6) 
        RETURNING id, phone, full_name, email, age, referral_code, created_at`,
-      [phone, name, email, age, generateReferralCode(), hashedPassword]
+      [normalizedPhone, name, email, age, generateReferralCode(), hashedPassword]
     );
     
     const userId = userResult.rows[0].id;
@@ -228,12 +347,27 @@ app.post('/api/register', async (req, res) => {
     
     await pool.query('COMMIT');
     
-    // Generate JWT
+    // Generate JWT with UUID
+    const expiresIn = process.env.JWT_EXPIRES_IN || '7d';
+    console.log('🔑 Using expiration for registration:', expiresIn);
+    console.log('🔑 User ID from database (UUID):', userId);
+    
     const token = jwt.sign(
-      { userId, phone, email }, 
+      { 
+        userId: userId,  // This is the UUID from database
+        phone: normalizedPhone, 
+        email: email 
+      }, 
       process.env.JWT_SECRET, 
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+      { expiresIn: expiresIn }
     );
+    
+    console.log('✅ Token generated for registration');
+    console.log('🔑 Token preview:', token.substring(0, 30) + '...');
+    
+    // Decode to verify expiration
+    const decoded = jwt.decode(token);
+    console.log('📦 Token expires at:', new Date(decoded.exp * 1000).toLocaleString());
     
     console.log('✅ User registered successfully:', userId);
     
@@ -257,17 +391,21 @@ app.post('/api/login', async (req, res) => {
   try {
     console.log('🔐 Login attempt for:', phone);
     
+    // Normalize phone for lookup
+    const normalizedPhone = normalizePhoneForDatabase(phone);
+    console.log('📱 Normalized phone for lookup:', normalizedPhone);
+    
     // Get user
     const userResult = await pool.query(
       `SELECT p.*, w.main_balance, w.bonus_balance, w.affiliate_balance 
        FROM profiles p 
        LEFT JOIN wallets w ON p.id = w.user_id 
        WHERE p.phone = $1`,
-      [phone]
+      [normalizedPhone]
     );
     
     if (userResult.rows.length === 0) {
-      console.log('❌ User not found:', phone);
+      console.log('❌ User not found:', normalizedPhone);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     
@@ -276,7 +414,7 @@ app.post('/api/login', async (req, res) => {
     // Verify password
     const validPassword = await bcrypt.compare(password, user.password_hash);
     if (!validPassword) {
-      console.log('❌ Invalid password for:', phone);
+      console.log('❌ Invalid password for:', normalizedPhone);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     
@@ -286,12 +424,43 @@ app.post('/api/login', async (req, res) => {
       [req.ip || req.connection.remoteAddress, user.id]
     );
     
-    // Generate JWT
+    // Generate JWT with UUID
+    const expiresIn = process.env.JWT_EXPIRES_IN || '7d';
+    console.log('🔑 JWT_EXPIRES_IN from env:', expiresIn);
+    console.log('🔑 User ID from database (UUID):', user.id);
+    
     const token = jwt.sign(
-      { userId: user.id, phone: user.phone, email: user.email }, 
+      { 
+        userId: user.id,  // This is the UUID from database
+        phone: user.phone, 
+        email: user.email 
+      }, 
       process.env.JWT_SECRET, 
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+      { expiresIn: expiresIn }
     );
+    
+    console.log('✅ Token generated with expiration:', expiresIn);
+    console.log('🔑 Token preview:', token.substring(0, 30) + '...');
+    console.log('🔑 Token length:', token.length);
+    
+    // Decode to verify expiration
+    const decoded = jwt.decode(token);
+    const expiresAt = new Date(decoded.exp * 1000);
+    const now = new Date();
+    const expiresInMs = expiresAt.getTime() - now.getTime();
+    const expiresInHours = expiresInMs / (1000 * 60 * 60);
+    
+    console.log('📦 Current time:', now.toLocaleString());
+    console.log('📦 Token expires at:', expiresAt.toLocaleString());
+    console.log('📦 Token expires in:', expiresInHours.toFixed(2), 'hours');
+    
+    // Verify the token immediately to ensure it's valid
+    try {
+      jwt.verify(token, process.env.JWT_SECRET);
+      console.log('✅ Token verification passed immediately after creation');
+    } catch (verifyError) {
+      console.error('❌ Token verification failed immediately:', verifyError.message);
+    }
     
     console.log('✅ Login successful for:', user.id);
     
@@ -532,13 +701,14 @@ const getMpesaToken = async () => {
   }
 };
 
-// ==================== M-PESA STK PUSH ====================
+// ==================== FIXED M-PESA STK PUSH WITH USER VALIDATION ====================
 app.post('/api/mpesa/stkpush', authenticateToken, async (req, res) => {
   const { userId, phoneNumber, amount } = req.body;
   
   try {
     console.log('📱 ===== M-PESA STK PUSH INITIATED =====');
-    console.log('📱 User ID:', userId);
+    console.log('📱 User ID from request:', userId);
+    console.log('📱 User ID type:', typeof userId);
     console.log('📱 Phone:', phoneNumber);
     console.log('📱 Amount:', amount);
 
@@ -550,45 +720,88 @@ app.post('/api/mpesa/stkpush', authenticateToken, async (req, res) => {
       });
     }
 
-    // Format phone number (must be 254XXXXXXXXX)
-    let formattedPhone = phoneNumber.replace(/[^0-9]/g, '');
-    if (formattedPhone.startsWith('0')) {
-      formattedPhone = '254' + formattedPhone.substring(1);
-    } else if (formattedPhone.startsWith('7')) {
-      formattedPhone = '254' + formattedPhone;
-    }
+    // Format phone number
+    let formattedPhone = formatPhoneForMPesa(phoneNumber);
+    console.log('📱 Formatted phone for M-PESA:', formattedPhone);
     
-    // Ensure it's exactly 12 digits (254 + 9 digits)
     if (formattedPhone.length !== 12) {
       return res.status(400).json({
         success: false,
         error: 'Invalid phone number format. Use 07XXXXXXXX or 2547XXXXXXXX'
       });
     }
-    
-    console.log('📱 Formatted phone:', formattedPhone);
 
-    // Get access token
+    // ===== CRITICAL: Find user by phone number since token might have numeric ID =====
+    console.log('🔍 Looking up user by phone number:', formattedPhone);
+    
+    // Try to find user by the formatted phone number
+    const userByPhone = await pool.query(
+      'SELECT id, phone, full_name FROM profiles WHERE phone = $1',
+      [formattedPhone]
+    );
+    
+    let dbUserId;
+    
+    if (userByPhone.rows.length > 0) {
+      dbUserId = userByPhone.rows[0].id;
+      console.log('✅ Found user by phone:');
+      console.log('   - UUID:', dbUserId);
+      console.log('   - Phone:', userByPhone.rows[0].phone);
+      console.log('   - Name:', userByPhone.rows[0].full_name);
+    } else {
+      console.log('❌ User not found with phone:', formattedPhone);
+      
+      // Try with the original phone number
+      const originalPhoneSearch = await pool.query(
+        'SELECT id, phone, full_name FROM profiles WHERE phone = $1',
+        [phoneNumber]
+      );
+      
+      if (originalPhoneSearch.rows.length > 0) {
+        dbUserId = originalPhoneSearch.rows[0].id;
+        console.log('✅ Found user by original phone:');
+        console.log('   - UUID:', dbUserId);
+        console.log('   - Phone:', originalPhoneSearch.rows[0].phone);
+      } else {
+        console.error('❌ User NOT FOUND with any phone format');
+        
+        // Debug: List some users to see what phones exist
+        const sampleUsers = await pool.query(
+          'SELECT id, phone, full_name FROM profiles LIMIT 5'
+        );
+        console.log('📋 Sample users in database:');
+        sampleUsers.rows.forEach(user => {
+          console.log(`   - ID: ${user.id}, Phone: ${user.phone}, Name: ${user.full_name}`);
+        });
+        
+        return res.status(400).json({ 
+          success: false, 
+          error: 'User account not found. Please login again.' 
+        });
+      }
+    }
+
+    // Get M-PESA token
+    console.log('🔄 Getting M-PESA token...');
     const token = await getMpesaToken();
+    console.log('✅ Token obtained');
 
-    // Generate timestamp in format YYYYMMDDHHmmss
+    // Generate timestamp
     const date = new Date();
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    const hours = String(date.getHours()).padStart(2, '0');
-    const minutes = String(date.getMinutes()).padStart(2, '0');
-    const seconds = String(date.getSeconds()).padStart(2, '0');
-    const timestamp = `${year}${month}${day}${hours}${minutes}${seconds}`;
+    const timestamp = date.getFullYear() +
+      String(date.getMonth() + 1).padStart(2, '0') +
+      String(date.getDate()).padStart(2, '0') +
+      String(date.getHours()).padStart(2, '0') +
+      String(date.getMinutes()).padStart(2, '0') +
+      String(date.getSeconds()).padStart(2, '0');
     
-    // Generate password (BusinessShortCode + Passkey + Timestamp)
+    // Generate password
     const password = Buffer.from(
       `${MPESA_CONFIG.businessShortCode}${MPESA_CONFIG.passkey}${timestamp}`
     ).toString('base64');
 
     // Generate unique reference
-    const reference = 'LBB' + Date.now().toString().slice(-8);
-    const checkoutRequestId = `ws_CO_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+    const reference = 'LBB' + Date.now() + Math.random().toString(36).substring(2, 10).toUpperCase();
 
     // Prepare STK Push request
     const stkPushData = {
@@ -596,119 +809,116 @@ app.post('/api/mpesa/stkpush', authenticateToken, async (req, res) => {
       Password: password,
       Timestamp: timestamp,
       TransactionType: 'CustomerPayBillOnline',
-      Amount: Math.floor(amount), // Ensure integer
+      Amount: Math.floor(amount),
       PartyA: formattedPhone,
       PartyB: MPESA_CONFIG.businessShortCode,
       PhoneNumber: formattedPhone,
       CallBackURL: MPESA_CONFIG.callbackUrl,
-      AccountReference: MPESA_CONFIG.accountReference,
-      TransactionDesc: `${MPESA_CONFIG.transactionDesc} - ${reference}`
+      AccountReference: 'LobbyBets',
+      TransactionDesc: `Deposit - ${reference}`
     };
 
     console.log('📤 Sending STK Push request to Safaricom...');
-    console.log('📤 Request data:', JSON.stringify(stkPushData, null, 2));
 
-    // Make STK Push request to Safaricom
+    // Send to Safaricom
     const stkResponse = await axios.post(MPESA_CONFIG.stkPushUrl, stkPushData, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 15000 // 15 second timeout
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 15000
     });
 
-    console.log('📥 Safaricom response:', JSON.stringify(stkResponse.data, null, 2));
+    console.log('📥 Safaricom response:', stkResponse.data);
 
     const { 
       ResponseCode, 
       ResponseDescription, 
       MerchantRequestID, 
       CheckoutRequestID,
-      CustomerMessage
+      CustomerMessage 
     } = stkResponse.data;
 
-    // Start database transaction
-    await pool.query('BEGIN');
+    // Insert transaction with the database UUID
+  // Insert transaction with the database UUID - USING EXACT COLUMN NAMES
+const result = await pool.query(
+  `INSERT INTO mpesa_transactions (
+    user_id,
+    phone_number,
+    amount,
+    reference,
+    checkout_request_id,
+    merchant_request_id,  -- Make sure this matches exactly
+    type,
+    payment_type,
+    status,
+    result_code,
+    result_description,
+    customer_message,
+    created_at
+  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+  RETURNING id`,
+  [
+    dbUserId,                          // $1 - UUID from database
+    formattedPhone,                    // $2
+    amount,                            // $3
+    reference,                         // $4
+    CheckoutRequestID || null,         // $5
+    MerchantRequestID || null,          // $6
+    'deposit',                          // $7
+    'stk',                              // $8
+    'pending',                          // $9
+    ResponseCode ? parseInt(ResponseCode) : null,  // $10
+    ResponseDescription || null,         // $11
+    CustomerMessage || null              // $12
+  ]
+);
 
-    // Create transaction record
-    const mpesaResult = await pool.query(
-      `INSERT INTO mpesa_transactions 
-       (user_id, phone_number, amount, reference, checkout_request_id, merchant_request_id,
-        type, payment_type, status, response_code, response_description, customer_message)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-       RETURNING id`,
-      [
-        userId, formattedPhone, amount, reference, CheckoutRequestID, MerchantRequestID,
-        'deposit', 'stk', 'pending', ResponseCode, ResponseDescription, CustomerMessage
-      ]
-    );
-
-    await pool.query('COMMIT');
+    console.log('✅ Transaction inserted with ID:', result.rows[0].id);
 
     if (ResponseCode === '0') {
-      // Success - customer will receive STK prompt
       res.json({ 
         success: true, 
-        message: CustomerMessage || 'STK Push sent. Please check your phone and enter PIN to complete payment.',
-        transactionId: mpesaResult.rows[0].id,
+        message: CustomerMessage || 'STK Push sent. Please check your phone to complete payment.',
+        transactionId: result.rows[0].id,
         checkoutRequestId: CheckoutRequestID,
-        merchantRequestId: MerchantRequestID,
         reference
       });
     } else {
-      // Failed
       res.status(400).json({ 
         success: false, 
-        error: ResponseDescription || 'Failed to initiate STK Push',
-        transactionId: mpesaResult.rows[0].id
+        error: ResponseDescription || 'Failed to initiate STK Push'
       });
     }
     
   } catch (error) {
-    await pool.query('ROLLBACK').catch(e => console.error('Rollback error:', e));
+    console.error('❌ STK Push error:', error);
     
-    console.error('❌ STK Push error:', error.response?.data || error.message);
-    
-    // Provide more specific error message
-    let errorMessage = 'Failed to initiate payment. ';
-    
-    if (error.code === 'ECONNABORTED') {
-      errorMessage += 'Request timeout. Please try again.';
-    } else if (error.response) {
-      const { data } = error.response;
-      if (data.errorCode === '500.001.1001') {
-        errorMessage += 'Authentication failed. Please contact support.';
-      } else if (data.errorCode === '500.001.1002') {
-        errorMessage += 'Invalid request. Please check phone number.';
-      } else {
-        errorMessage += data.errorMessage || 'Please try again.';
-      }
-    } else if (error.request) {
-      errorMessage += 'Network error. Please check your connection.';
-    } else {
-      errorMessage += error.message;
+    if (error.code === '23503') { // Foreign key violation
+      console.error('❌ Foreign key violation - user_id does not exist in profiles table');
+      return res.status(400).json({ 
+        success: false, 
+        error: 'User account issue. Please try logging in again.' 
+      });
     }
     
     res.status(500).json({ 
       success: false, 
-      error: errorMessage
+      error: 'Failed to initiate payment. Please try again.'
     });
   }
 });
 
-// ==================== M-PESA CALLBACK ====================
+// ==================== FIXED M-PESA CALLBACK ====================
 app.post('/api/mpesa/callback', async (req, res) => {
   console.log('📞 ===== M-PESA CALLBACK RECEIVED =====');
   console.log('📞 Callback body:', JSON.stringify(req.body, null, 2));
   
-  // Always acknowledge receipt immediately (Safaricom requires this)
+  // Always acknowledge immediately
   res.json({ ResultCode: 0, ResultDesc: 'Success' });
   
   try {
     const { Body } = req.body;
     
-    if (!Body || !Body.stkCallback) {
-      console.log('❌ Invalid callback body - missing stkCallback');
+    if (!Body?.stkCallback) {
+      console.log('❌ Invalid callback data');
       return;
     }
 
@@ -718,9 +928,8 @@ app.post('/api/mpesa/callback', async (req, res) => {
       CheckoutRequestID, 
       CallbackMetadata 
     } = Body.stkCallback;
-    
-    console.log(`📞 ResultCode: ${ResultCode}, ResultDesc: ${ResultDesc}`);
-    console.log(`📞 CheckoutRequestID: ${CheckoutRequestID}`);
+
+    console.log(`📞 CheckoutRequestID: ${CheckoutRequestID}, ResultCode: ${ResultCode}`);
 
     // Find transaction
     const transaction = await pool.query(
@@ -729,7 +938,7 @@ app.post('/api/mpesa/callback', async (req, res) => {
     );
     
     if (transaction.rows.length === 0) {
-      console.log('❌ Transaction not found for CheckoutRequestID:', CheckoutRequestID);
+      console.log('❌ Transaction not found:', CheckoutRequestID);
       return;
     }
 
@@ -740,34 +949,31 @@ app.post('/api/mpesa/callback', async (req, res) => {
       // Payment successful - extract metadata
       let amount = tx.amount;
       let receipt = '';
-      let phone = tx.phone_number;
-      let transactionDate = '';
+      let phoneNumber = '';
       
-      if (CallbackMetadata && CallbackMetadata.Item) {
+      if (CallbackMetadata?.Item) {
         CallbackMetadata.Item.forEach(item => {
           if (item.Name === 'Amount') amount = item.Value;
           if (item.Name === 'MpesaReceiptNumber') receipt = item.Value;
-          if (item.Name === 'PhoneNumber') phone = item.Value;
-          if (item.Name === 'TransactionDate') transactionDate = item.Value;
+          if (item.Name === 'PhoneNumber') phoneNumber = item.Value;
         });
       }
-      
-      console.log(`✅ Payment successful: KES ${amount}, Receipt: ${receipt}, Date: ${transactionDate}`);
-      
+
       await pool.query('BEGIN');
-      
-      // Update transaction
+
+      // Update transaction - include all fields
       await pool.query(
         `UPDATE mpesa_transactions 
          SET status = 'completed', 
-             result_code = $1,
-             result_description = $2,
-             mpesa_receipt_number = $3,
-             completed_at = NOW()
-         WHERE checkout_request_id = $4`,
-        [ResultCode, ResultDesc, receipt, CheckoutRequestID]
+             mpesa_receipt_number = $1,
+             result_code = $2,
+             result_description = $3,
+             completed_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $4`,
+        [receipt, ResultCode, ResultDesc, tx.id]
       );
-      
+
       // Get current balance
       const walletResult = await pool.query(
         'SELECT main_balance FROM wallets WHERE user_id = $1',
@@ -775,29 +981,27 @@ app.post('/api/mpesa/callback', async (req, res) => {
       );
       
       const currentBalance = parseFloat(walletResult.rows[0]?.main_balance || 0);
-      
+
       // Update wallet
       await pool.query(
         `UPDATE wallets 
          SET main_balance = main_balance + $1,
              lifetime_deposits = lifetime_deposits + $1,
-             last_updated = NOW()
+             updated_at = NOW()
          WHERE user_id = $2`,
         [amount, tx.user_id]
       );
-      
+
       // Create transaction record
       await pool.query(
         `INSERT INTO transactions 
-         (user_id, type, amount, status, description, reference, method, payment_type, 
-          balance_before, balance_after, mpesa_receipt, mpesa_transaction_id)
-         VALUES ($1, 'deposit', $2, 'completed', 'M-PESA deposit', $3, 'mpesa', 'stk', 
-                 $4, $4 + $2, $5, $6)`,
-        [tx.user_id, amount, tx.reference, currentBalance, receipt, tx.id]
+         (user_id, type, amount, status, description, reference, balance_before, balance_after, created_at)
+         VALUES ($1, 'deposit', $2, 'completed', 'M-PESA deposit', $3, $4, $4 + $2, NOW())`,
+        [tx.user_id, amount, tx.reference, currentBalance]
       );
-      
+
       await pool.query('COMMIT');
-      console.log(`✅ Wallet updated for user ${tx.user_id}: +KES ${amount}`);
+      console.log(`✅ Wallet updated for user ${tx.user_id}: +KES ${amount} (Receipt: ${receipt})`);
       
     } else {
       // Payment failed
@@ -805,16 +1009,18 @@ app.post('/api/mpesa/callback', async (req, res) => {
       
       await pool.query(
         `UPDATE mpesa_transactions 
-         SET status = 'failed', 
+         SET status = 'failed',
              result_code = $1,
-             result_description = $2
-         WHERE checkout_request_id = $3`,
-        [ResultCode, ResultDesc, CheckoutRequestID]
+             result_description = $2,
+             updated_at = NOW()
+         WHERE id = $3`,
+        [ResultCode, ResultDesc, tx.id]
       );
     }
+    
   } catch (error) {
-    console.error('❌ Callback processing error:', error);
-    await pool.query('ROLLBACK').catch(e => console.error('Rollback error:', e));
+    console.error('❌ Callback error:', error);
+    await pool.query('ROLLBACK').catch(e => {});
   }
 });
 
@@ -861,6 +1067,75 @@ app.post('/api/mpesa/query', authenticateToken, async (req, res) => {
   }
 });
 
+// ==================== FORGOT PASSWORD / RESET PASSWORD ====================
+
+// Reset password endpoint (no OTP, direct reset)
+app.post('/api/reset-password', async (req, res) => {
+  const { phone, newPassword } = req.body;
+  
+  try {
+    console.log('🔐 Password reset attempt for phone:', phone);
+    
+    // Validate input
+    if (!phone || !newPassword) {
+      return res.status(400).json({ error: 'Phone and new password are required' });
+    }
+    
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+    
+    // Format phone number (handle both 07... and 254... formats)
+    let formattedPhone = normalizePhoneForDatabase(phone);
+    console.log('📱 Formatted phone for lookup:', formattedPhone);
+    
+    // Check if user exists
+    const userResult = await pool.query(
+      'SELECT id, full_name, phone FROM profiles WHERE phone = $1',
+      [formattedPhone]
+    );
+    
+    if (userResult.rows.length === 0) {
+      console.log('❌ User not found with phone:', formattedPhone);
+      return res.status(404).json({ error: 'User not found with this phone number' });
+    }
+    
+    const user = userResult.rows[0];
+    console.log('✅ User found:', user.id, user.full_name);
+    
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    
+    // Update password in database
+    await pool.query(
+      `UPDATE profiles 
+       SET password_hash = $1, 
+           updated_at = NOW(),
+           last_password_reset = NOW()
+       WHERE id = $2`,
+      [hashedPassword, user.id]
+    );
+    
+    // Log password reset in audit table (optional)
+    await pool.query(
+      `INSERT INTO password_resets (user_id, reset_method, reset_at)
+       VALUES ($1, 'direct', NOW())`,
+      [user.id]
+    );
+    
+    console.log('✅ Password reset successful for user:', user.id);
+    
+    res.json({ 
+      success: true, 
+      message: 'Password reset successful. You can now login with your new password.'
+    });
+    
+  } catch (error) {
+    console.error('❌ Reset password error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==================== CHECK PAYMENT STATUS ====================
 app.get('/api/payment/status/:transactionId', authenticateToken, async (req, res) => {
   const { transactionId } = req.params;
@@ -868,7 +1143,7 @@ app.get('/api/payment/status/:transactionId', authenticateToken, async (req, res
   try {
     const result = await pool.query(
       `SELECT status, amount, mpesa_receipt_number, completed_at, 
-              result_code, result_description, response_code, response_description
+              result_code, result_description
        FROM mpesa_transactions 
        WHERE id = $1`,
       [transactionId]
@@ -1488,6 +1763,7 @@ app.post('/api/support/tickets/:ticketId/reply', authenticateToken, async (req, 
     res.status(500).json({ error: error.message });
   }
 });
+
 // ==================== FAQ ENDPOINT ====================
 
 // Get FAQs
@@ -1661,6 +1937,7 @@ app.get('/api/support/stats', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 // ==================== LEAGUES AND MATCHES ====================
 
 // Get all leagues
@@ -1780,114 +2057,7 @@ app.get('/api/stats/:userId', authenticateToken, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-// ==================== WITHDRAWAL ENDPOINT ====================
-app.post('/api/withdraw', authenticateToken, async (req, res) => {
-  const { userId, phoneNumber, amount, method } = req.body;
-  
-  try {
-    console.log('📤 Withdrawal initiated:', { userId, phoneNumber, amount, method });
-    
-    await pool.query('BEGIN');
-    
-    // Check if user has enough balance
-    const walletResult = await pool.query(
-      'SELECT main_balance FROM wallets WHERE user_id = $1',
-      [userId]
-    );
-    
-    if (walletResult.rows.length === 0) {
-      await pool.query('ROLLBACK');
-      return res.status(404).json({ error: 'Wallet not found' });
-    }
-    
-    const currentBalance = parseFloat(walletResult.rows[0].main_balance);
-    
-    if (currentBalance < amount) {
-      await pool.query('ROLLBACK');
-      return res.status(400).json({ 
-        error: 'Insufficient balance',
-        available: currentBalance,
-        requested: amount
-      });
-    }
-    
-    // Validate minimum withdrawal
-    if (amount < 50) {
-      await pool.query('ROLLBACK');
-      return res.status(400).json({ error: 'Minimum withdrawal is KES 50' });
-    }
-    
-    // Format phone number
-    const formattedPhone = formatPhoneForMPesa(phoneNumber);
-    
-    // Generate reference
-    const reference = 'WDR' + Date.now().toString().slice(-8);
-    
-    // Create withdrawal transaction record
-    const withdrawalResult = await pool.query(
-      `INSERT INTO mpesa_transactions (user_id, phone_number, amount, reference, type, payment_type, status)
-       VALUES ($1, $2, $3, $4, 'withdrawal', 'stk', 'pending')
-       RETURNING id`,
-      [userId, formattedPhone, amount, reference]
-    );
-    
-    // Deduct from wallet
-    await pool.query(
-      `UPDATE wallets 
-       SET main_balance = main_balance - $1,
-           lifetime_withdrawals = lifetime_withdrawals + $1,
-           last_updated = NOW()
-       WHERE user_id = $2`,
-      [amount, userId]
-    );
-    
-    // Create transaction record
-    await pool.query(
-      `INSERT INTO transactions (user_id, type, amount, status, description, reference, method, balance_before, balance_after)
-       VALUES ($1, 'withdrawal', $2, 'pending', 'Withdrawal via ' || $3, $4, $3, $5, $5 - $2)`,
-      [userId, amount, method, reference, currentBalance]
-    );
-    
-    await pool.query('COMMIT');
-    
-    // Simulate processing
-    setTimeout(async () => {
-      try {
-        await pool.query(
-          `UPDATE mpesa_transactions 
-           SET status = 'completed', 
-               mpesa_receipt_number = $1,
-               completed_at = NOW()
-           WHERE id = $2`,
-          ['WDR' + Date.now().toString().slice(-10), withdrawalResult.rows[0].id]
-        );
-        
-        await pool.query(
-          `UPDATE transactions 
-           SET status = 'completed', completed_at = NOW()
-           WHERE reference = $1`,
-          [reference]
-        );
-        
-        console.log(`✅ Withdrawal completed for user ${userId}: KES ${amount}`);
-      } catch (error) {
-        console.error('Withdrawal completion error:', error);
-      }
-    }, 3000);
-    
-    res.json({ 
-      success: true, 
-      message: 'Withdrawal initiated successfully',
-      transactionId: withdrawalResult.rows[0].id,
-      reference
-    });
-    
-  } catch (error) {
-    await pool.query('ROLLBACK');
-    console.error('❌ Withdrawal error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+
 // ==================== ERROR HANDLING MIDDLEWARE ====================
 app.use((err, req, res, next) => {
   console.error('❌ Unhandled error:', err);
@@ -1911,6 +2081,8 @@ const server = app.listen(port, '0.0.0.0', () => {
   console.log(`📊 Database: ${process.env.DB_NAME || 'lobbybets'}`);
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🔓 CORS: Enabled for ${allowedOrigins.length} origins`);
+  console.log(`🔑 JWT_SECRET: ${process.env.JWT_SECRET ? '✅ Loaded' : '❌ Missing'}`);
+  console.log(`🔑 JWT_EXPIRES_IN: ${process.env.JWT_EXPIRES_IN || '7d (default)'}`);
   console.log(`=========================================`);
   console.log(`📋 Available Endpoints:`);
   console.log(`   🔧 GET  /api/health`);
@@ -1922,11 +2094,11 @@ const server = app.listen(port, '0.0.0.0', () => {
   console.log(`   💰 GET  /api/wallet/:userId`);
   console.log(`   💳 GET  /api/transactions/:userId`);
   console.log(`   💸 POST /api/withdraw`);
-  console.log(`   🎲 POST /api/bets (FIXED)`);
-  console.log(`   📋 GET  /api/bets/:userId (FIXED)`);
+  console.log(`   🎲 POST /api/bets`);
+  console.log(`   📋 GET  /api/bets/:userId`);
   console.log(`   ❌ POST /api/bets/:betId/cancel`);
-  console.log(`   🎁 GET  /api/bonuses/:userId (FIXED)`);
-  console.log(`   🎁 POST /api/bonuses/welcome/claim (NEW)`);
+  console.log(`   🎁 GET  /api/bonuses/:userId`);
+  console.log(`   🎁 POST /api/bonuses/welcome/claim`);
   console.log(`   🏆 GET  /api/jackpot/current`);
   console.log(`   🏆 POST /api/jackpot/entry`);
   console.log(`   📞 POST /api/mpesa/stkpush`);
@@ -1935,12 +2107,14 @@ const server = app.listen(port, '0.0.0.0', () => {
   console.log(`   🎫 POST /api/support/tickets`);
   console.log(`   ⚽ GET  /api/leagues`);
   console.log(`   ⚽ GET  /api/matches/upcoming`);
+  console.log(`   🔐 POST /api/reset-password`);
   console.log(`   🔴 GET  /api/matches/live`);
   console.log(`   📊 GET  /api/stats/:userId`);
-  console.log(`   📚 GET  /api/support/faqs (NEW)`);
-console.log(`   📞 GET  /api/support/contact (NEW)`);
-console.log(`   📝 POST /api/support/feedback (NEW)`);
-console.log(`   📊 GET  /api/support/stats (NEW)`);
+  console.log(`   📚 GET  /api/support/faqs`);
+  console.log(`   📞 GET  /api/support/contact`);
+  console.log(`   📝 POST /api/support/feedback`);
+  console.log(`   📊 GET  /api/support/stats`);
+  console.log(`   🧪 GET  /api/test-jwt`);
   console.log(`=========================================`);
 });
 
