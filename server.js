@@ -286,6 +286,535 @@ app.get('/api/health', async (req, res) => {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
+// ==================== ADMIN HELPER FUNCTIONS ====================
+
+// Check if user is admin
+const isAdmin = async (userId) => {
+  try {
+    const result = await pool.query(
+      'SELECT "role" FROM profiles WHERE id = $1',
+      [userId]
+    );
+    return result.rows[0]?.role === 'admin' || result.rows[0]?.role === 'super_admin';
+  } catch (error) {
+    console.error('❌ Error checking admin status:', error);
+    return false;
+  }
+};
+
+// Check if user is super admin
+const isSuperAdmin = async (userId) => {
+  try {
+    const result = await pool.query(
+      'SELECT "role" FROM profiles WHERE id = $1',
+      [userId]
+    );
+    return result.rows[0]?.role === 'super_admin';
+  } catch (error) {
+    console.error('❌ Error checking super admin status:', error);
+    return false;
+  }
+};
+
+// ==================== ADMIN AUTHENTICATION MIDDLEWARE ====================
+// Define this ONLY ONCE at the top of your admin section
+const authenticateAdmin = async (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const result = await pool.query(
+      'SELECT id, full_name, email, phone, role, is_active FROM admins WHERE id = $1',
+      [decoded.adminId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    
+    const admin = result.rows[0];
+    
+    if (!admin.is_active) {
+      return res.status(403).json({ error: 'Account is deactivated' });
+    }
+    
+    req.admin = admin;
+    next();
+  } catch (error) {
+    console.error('❌ Admin auth error:', error);
+    return res.status(403).json({ error: 'Invalid or expired token' });
+  }
+};
+
+// ==================== PUBLIC ADMIN ROUTES ====================
+// These routes DON'T need authentication
+
+// Register first super admin (only works if no admins exist)
+app.post('/api/admin/register-first', async (req, res) => {
+  const { full_name, email, phone, password } = req.body;
+  
+  try {
+    // Validate input
+    if (!full_name || !email || !phone || !password) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+    
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+    
+    // Check if any admin already exists
+    const adminCount = await pool.query('SELECT COUNT(*) FROM admins');
+    
+    if (parseInt(adminCount.rows[0].count) > 0) {
+      return res.status(403).json({ 
+        error: 'Initial setup already completed. Maximum 3 admins allowed.' 
+      });
+    }
+    
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    // Create first super admin
+    const result = await pool.query(
+      `INSERT INTO admins (full_name, email, phone, password_hash, role) 
+       VALUES ($1, $2, $3, $4, 'super_admin') 
+       RETURNING id, full_name, email, phone, role, created_at`,
+      [full_name, email, phone, hashedPassword]
+    );
+    
+    const admin = result.rows[0];
+    
+    // Generate JWT
+    const token = jwt.sign(
+      { adminId: admin.id, email: admin.email, role: admin.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    
+    console.log('✅ First super admin created:', email);
+    console.log('📊 Total admins now: 1');
+    
+    res.json({
+      success: true,
+      message: 'Super admin created successfully',
+      token,
+      admin
+    });
+    
+  } catch (error) {
+    console.error('❌ Error creating first admin:', error);
+    
+    if (error.code === '23505') { // Unique violation
+      return res.status(400).json({ error: 'Email or phone already exists' });
+    }
+    
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin login (public)
+app.post('/api/admin/login', async (req, res) => {
+  const { email, password } = req.body;
+  
+  try {
+    console.log('👑 Admin login attempt for:', email);
+    
+    const result = await pool.query(
+      'SELECT id, full_name, email, phone, role, password_hash, is_active FROM admins WHERE email = $1',
+      [email]
+    );
+    
+    if (result.rows.length === 0) {
+      console.log('❌ Admin not found:', email);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const admin = result.rows[0];
+    
+    // Check if account is active
+    if (!admin.is_active) {
+      console.log('❌ Admin account deactivated:', email);
+      return res.status(403).json({ error: 'Account is deactivated. Contact super admin.' });
+    }
+    
+    // Verify password
+    const validPassword = await bcrypt.compare(password, admin.password_hash);
+    if (!validPassword) {
+      console.log('❌ Invalid password for admin:', email);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Update last login
+    await pool.query(
+      'UPDATE admins SET last_login_at = NOW(), last_login_ip = $1 WHERE id = $2',
+      [req.ip || req.connection.remoteAddress, admin.id]
+    );
+    
+    // Generate JWT
+    const token = jwt.sign(
+      { adminId: admin.id, email: admin.email, role: admin.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    
+    console.log('✅ Admin login successful:', admin.email, 'Role:', admin.role);
+    
+    res.json({
+      success: true,
+      token,
+      admin: {
+        id: admin.id,
+        full_name: admin.full_name,
+        email: admin.email,
+        phone: admin.phone,
+        role: admin.role
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Admin login error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Forgot password - simple reset without OTP (public)
+app.post('/api/admin/forgot-password', async (req, res) => {
+  const { email, newPassword } = req.body;
+  
+  try {
+    console.log('🔑 Password reset requested for:', email);
+    
+    // Validate input
+    if (!email || !newPassword) {
+      return res.status(400).json({ error: 'Email and new password are required' });
+    }
+    
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+    
+    // Check if admin exists
+    const admin = await pool.query(
+      'SELECT id FROM admins WHERE email = $1',
+      [email]
+    );
+    
+    if (admin.rows.length === 0) {
+      console.log('❌ Admin not found for password reset:', email);
+      return res.status(404).json({ error: 'Admin not found' });
+    }
+    
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    
+    // Update password
+    await pool.query(
+      'UPDATE admins SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+      [hashedPassword, admin.rows[0].id]
+    );
+    
+    console.log('✅ Password reset successful for:', email);
+    
+    res.json({
+      success: true,
+      message: 'Password reset successfully. You can now login with your new password.'
+    });
+    
+  } catch (error) {
+    console.error('❌ Password reset error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== PROTECTED ADMIN ROUTES ====================
+// These routes REQUIRE authentication (use authenticateAdmin middleware)
+
+// Create new admin (super admin only) - Limited to 3 total admins
+app.post('/api/admin/create', authenticateAdmin, async (req, res) => {
+  const { full_name, email, phone, password, role = 'admin' } = req.body;
+  
+  try {
+    // Check if requesting admin is super admin
+    if (req.admin.role !== 'super_admin') {
+      console.log('❌ Unauthorized attempt to create admin by:', req.admin.email);
+      return res.status(403).json({ error: 'Only super admins can create new admins' });
+    }
+    
+    // Validate input
+    if (!full_name || !email || !phone || !password) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+    
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+    
+    // Check if we've reached the limit of 3 admins
+    const adminCount = await pool.query('SELECT COUNT(*) FROM admins');
+    const currentCount = parseInt(adminCount.rows[0].count);
+    
+    if (currentCount >= 3) {
+      console.log('❌ Cannot create more admins. Current count:', currentCount);
+      return res.status(403).json({ 
+        error: 'Maximum of 3 admins allowed. Cannot create more.',
+        currentCount,
+        maxAllowed: 3
+      });
+    }
+    
+    // Check if email or phone already exists
+    const existing = await pool.query(
+      'SELECT id FROM admins WHERE email = $1 OR phone = $2',
+      [email, phone]
+    );
+    
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'Email or phone already exists' });
+    }
+    
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    // Create new admin
+    const result = await pool.query(
+      `INSERT INTO admins (full_name, email, phone, password_hash, role, created_by) 
+       VALUES ($1, $2, $3, $4, $5, $6) 
+       RETURNING id, full_name, email, phone, role, created_at`,
+      [full_name, email, phone, hashedPassword, role, req.admin.id]
+    );
+    
+    const newAdmin = result.rows[0];
+    
+    console.log('✅ New admin created by:', req.admin.email);
+    console.log('📊 Total admins now:', currentCount + 1);
+    
+    res.json({
+      success: true,
+      message: 'Admin created successfully',
+      admin: newAdmin,
+      totalAdmins: currentCount + 1,
+      remainingSlots: 3 - (currentCount + 1)
+    });
+    
+  } catch (error) {
+    console.error('❌ Error creating admin:', error);
+    
+    if (error.code === '23505') {
+      return res.status(400).json({ error: 'Email or phone already exists' });
+    }
+    
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all admins (super admin only)
+app.get('/api/admin/all', authenticateAdmin, async (req, res) => {
+  try {
+    // Check if requesting admin is super admin
+    if (req.admin.role !== 'super_admin') {
+      console.log('❌ Unauthorized attempt to view admins by:', req.admin.email);
+      return res.status(403).json({ error: 'Only super admins can view all admins' });
+    }
+    
+    const result = await pool.query(
+      `SELECT 
+        a.id, 
+        a.full_name, 
+        a.email, 
+        a.phone, 
+        a.role, 
+        a.is_active, 
+        a.last_login_at, 
+        a.created_at,
+        creator.full_name as created_by_name
+       FROM admins a
+       LEFT JOIN admins creator ON a.created_by = creator.id
+       ORDER BY a.created_at DESC`
+    );
+    
+    // Get total count
+    const countResult = await pool.query('SELECT COUNT(*) FROM admins');
+    const totalAdmins = parseInt(countResult.rows[0].count);
+    
+    console.log(`📊 Admins fetched: ${result.rows.length} (Total: ${totalAdmins}/3)`);
+    
+    res.json({
+      admins: result.rows,
+      total: totalAdmins,
+      maxAllowed: 3,
+      remainingSlots: 3 - totalAdmins
+    });
+    
+  } catch (error) {
+    console.error('❌ Error fetching admins:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get current admin profile (authenticated)
+app.get('/api/admin/profile', authenticateAdmin, async (req, res) => {
+  try {
+    res.json({
+      admin: {
+        id: req.admin.id,
+        full_name: req.admin.full_name,
+        email: req.admin.email,
+        phone: req.admin.phone,
+        role: req.admin.role
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error fetching admin profile:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Deactivate/reactivate admin (super admin only)
+app.put('/api/admin/:adminId/toggle-status', authenticateAdmin, async (req, res) => {
+  const { adminId } = req.params;
+  
+  try {
+    // Check if requesting admin is super admin
+    if (req.admin.role !== 'super_admin') {
+      console.log('❌ Unauthorized attempt to toggle status by:', req.admin.email);
+      return res.status(403).json({ error: 'Only super admins can modify admin status' });
+    }
+    
+    // Don't allow deactivating yourself
+    if (adminId === req.admin.id) {
+      return res.status(400).json({ error: 'Cannot deactivate your own account' });
+    }
+    
+    const result = await pool.query(
+      'UPDATE admins SET is_active = NOT is_active, updated_at = NOW() WHERE id = $1 RETURNING id, email, is_active',
+      [adminId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Admin not found' });
+    }
+    
+    const status = result.rows[0].is_active ? 'activated' : 'deactivated';
+    console.log(`✅ Admin ${result.rows[0].email} ${status} by:`, req.admin.email);
+    
+    res.json({ 
+      success: true, 
+      message: `Admin ${status} successfully`,
+      admin: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('❌ Error toggling admin status:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete admin (super admin only) - Only if under 3 admins
+app.delete('/api/admin/:adminId', authenticateAdmin, async (req, res) => {
+  const { adminId } = req.params;
+  
+  try {
+    // Check if requesting admin is super admin
+    if (req.admin.role !== 'super_admin') {
+      console.log('❌ Unauthorized attempt to delete admin by:', req.admin.email);
+      return res.status(403).json({ error: 'Only super admins can delete admins' });
+    }
+    
+    // Don't allow deleting yourself
+    if (adminId === req.admin.id) {
+      return res.status(400).json({ error: 'Cannot delete your own account' });
+    }
+    
+    // Check if we have at least 2 admins (can't delete the last one)
+    const countResult = await pool.query('SELECT COUNT(*) FROM admins');
+    const currentCount = parseInt(countResult.rows[0].count);
+    
+    if (currentCount <= 1) {
+      return res.status(400).json({ error: 'Cannot delete the last admin' });
+    }
+    
+    const result = await pool.query(
+      'DELETE FROM admins WHERE id = $1 RETURNING id, email',
+      [adminId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Admin not found' });
+    }
+    
+    console.log(`✅ Admin ${result.rows[0].email} deleted by:`, req.admin.email);
+    console.log(`📊 Total admins now: ${currentCount - 1}`);
+    
+    res.json({ 
+      success: true, 
+      message: 'Admin deleted successfully',
+      deletedAdmin: result.rows[0],
+      totalAdmins: currentCount - 1,
+      remainingSlots: 3 - (currentCount - 1)
+    });
+    
+  } catch (error) {
+    console.error('❌ Error deleting admin:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin dashboard statistics
+app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
+  try {
+    // Get system statistics
+    const userStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_users,
+        COUNT(*) FILTER (WHERE created_at::date = CURRENT_DATE) as new_users_today,
+        COUNT(*) FILTER (WHERE last_login_at > NOW() - INTERVAL '24 hours') as active_24h
+      FROM profiles
+    `);
+    
+    const betStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_bets,
+        COUNT(*) FILTER (WHERE created_at::date = CURRENT_DATE) as bets_today,
+        COALESCE(SUM(stake), 0) as total_wagered
+      FROM bets
+    `);
+    
+    const transactionStats = await pool.query(`
+      SELECT 
+        COALESCE(SUM(amount) FILTER (WHERE type = 'deposit' AND status = 'completed'), 0) as total_deposits,
+        COALESCE(SUM(amount) FILTER (WHERE type = 'withdrawal' AND status = 'completed'), 0) as total_withdrawals,
+        COUNT(*) FILTER (WHERE type = 'withdrawal' AND status = 'pending') as pending_withdrawals_count,
+        COALESCE(SUM(amount) FILTER (WHERE type = 'withdrawal' AND status = 'pending'), 0) as pending_withdrawals_amount
+      FROM transactions
+    `);
+    
+    const adminStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_admins,
+        COUNT(*) FILTER (WHERE role = 'super_admin') as super_admins
+      FROM admins
+    `);
+    
+    res.json({
+      users: userStats.rows[0],
+      bets: betStats.rows[0],
+      transactions: transactionStats.rows[0],
+      admins: adminStats.rows[0],
+      maxAdmins: 3,
+      remainingAdminSlots: 3 - parseInt(adminStats.rows[0].total_admins)
+    });
+    
+  } catch (error) {
+    console.error('❌ Admin stats error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // ==================== AUTHENTICATION ENDPOINTS ====================
 
@@ -1763,7 +2292,884 @@ app.post('/api/support/tickets/:ticketId/reply', authenticateToken, async (req, 
     res.status(500).json({ error: error.message });
   }
 });
+// ==================== PAYBILL PAYMENT ENDPOINTS ====================
 
+// Initiate Paybill payment
+app.post('/api/payments/paybill/initiate', authenticateToken, async (req, res) => {
+  const { userId, phoneNumber, amount } = req.body;
+  
+  try {
+    console.log('💰 Paybill initiation for user:', userId);
+    
+    // Verify user matches token
+    if (req.user.userId !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    // Check if user has a pending Paybill payment
+    const pendingPayment = await pool.query(
+      `SELECT id FROM paybill_payments 
+       WHERE user_id = $1 AND status = 'pending' AND expires_at > NOW()`,
+      [userId]
+    );
+    
+    if (pendingPayment.rows.length > 0) {
+      return res.json({
+        success: true,
+        message: 'You have a pending Paybill payment',
+        paymentId: pendingPayment.rows[0].id,
+        pending: true
+      });
+    }
+    
+    // Generate unique account number
+    const accountNumber = `LB${Date.now().toString().slice(-8)}${Math.floor(Math.random() * 100)}`;
+    
+    // Create pending payment record
+    const result = await pool.query(
+      `INSERT INTO paybill_payments 
+       (user_id, amount, phone_number, account_number, business_number, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending')
+       RETURNING id, account_number, business_number, expires_at`,
+      [userId, amount, phoneNumber, accountNumber, '4011243']
+    );
+    
+    const payment = result.rows[0];
+    
+    // Create a pending transaction record
+    const transaction = await pool.query(
+      `INSERT INTO transactions 
+       (user_id, type, amount, status, description, method, reference, metadata)
+       VALUES ($1, 'deposit', $2, 'pending', 'Paybill deposit', 'paybill', $3, $4)
+       RETURNING id`,
+      [userId, amount, `PB-${Date.now()}`, JSON.stringify({ paymentId: payment.id })]
+    );
+    
+    // Update payment with transaction ID
+    await pool.query(
+      'UPDATE paybill_payments SET transaction_id = $1 WHERE id = $2',
+      [transaction.rows[0].id, payment.id]
+    );
+    
+    res.json({
+      success: true,
+      paymentId: payment.id,
+      transactionId: transaction.rows[0].id,
+      accountNumber: payment.account_number,
+      businessNumber: payment.business_number,
+      amount,
+      expiresAt: payment.expires_at,
+      instructions: {
+        business: '4011243',
+        account: payment.account_number,
+        amount: amount
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Paybill initiation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Confirm Paybill payment (user clicks "I have paid")
+app.post('/api/payments/paybill/confirm', authenticateToken, async (req, res) => {
+  const { paymentId, confirmationCode } = req.body;
+  
+  try {
+    console.log('💰 Confirming Paybill payment:', paymentId);
+    
+    // Get payment details
+    const payment = await pool.query(
+      `SELECT pp.*, u.full_name 
+       FROM paybill_payments pp
+       JOIN profiles u ON pp.user_id = u.id
+       WHERE pp.id = $1`,
+      [paymentId]
+    );
+    
+    if (payment.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment not found' });
+    }
+    
+    const payData = payment.rows[0];
+    
+    // Verify user owns this payment
+    if (payData.user_id !== req.user.userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    // Check if payment is already confirmed
+    if (payData.status === 'confirmed') {
+      return res.json({
+        success: true,
+        message: 'Payment already confirmed',
+        alreadyConfirmed: true
+      });
+    }
+    
+    // Check if payment has expired
+    if (new Date(payData.expires_at) < new Date()) {
+      await pool.query(
+        'UPDATE paybill_payments SET status = $1 WHERE id = $2',
+        ['expired', paymentId]
+      );
+      return res.status(400).json({ error: 'Payment has expired. Please start a new deposit.' });
+    }
+    
+    // In a real system, you would verify with M-PESA API here
+    // For now, we'll simulate a successful confirmation
+    
+    // Update payment status
+    await pool.query(
+      `UPDATE paybill_payments 
+       SET status = 'confirmed', 
+           confirmed_at = NOW(),
+           confirmation_code = $1
+       WHERE id = $2`,
+      [confirmationCode || `CONF-${Date.now()}`, paymentId]
+    );
+    
+    // Update transaction status to completed
+    await pool.query(
+      `UPDATE transactions 
+       SET status = 'completed', 
+           completed_at = NOW(),
+           description = 'Paybill deposit confirmed'
+       WHERE id = $1`,
+      [payData.transaction_id]
+    );
+    
+    // Update wallet balance
+    await pool.query(
+      `UPDATE wallets 
+       SET main_balance = main_balance + $1,
+           lifetime_deposits = lifetime_deposits + $1,
+           last_updated = NOW()
+       WHERE user_id = $2`,
+      [payData.amount, payData.user_id]
+    );
+    
+    // Create notification (optional)
+    console.log(`✅ Payment confirmed for user ${payData.user_id}: +KES ${payData.amount}`);
+    
+    res.json({
+      success: true,
+      message: 'Payment confirmed successfully',
+      amount: payData.amount
+    });
+    
+  } catch (error) {
+    console.error('❌ Paybill confirmation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Check Paybill payment status
+app.get('/api/payments/paybill/status/:paymentId', authenticateToken, async (req, res) => {
+  const { paymentId } = req.params;
+  
+  try {
+    const payment = await pool.query(
+      `SELECT pp.*, t.status as transaction_status
+       FROM paybill_payments pp
+       LEFT JOIN transactions t ON pp.transaction_id = t.id
+       WHERE pp.id = $1`,
+      [paymentId]
+    );
+    
+    if (payment.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment not found' });
+    }
+    
+    const payData = payment.rows[0];
+    
+    // Verify user owns this payment
+    if (payData.user_id !== req.user.userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    res.json({
+      status: payData.status,
+      amount: payData.amount,
+      expiresAt: payData.expires_at,
+      transactionStatus: payData.transaction_status
+    });
+    
+  } catch (error) {
+    console.error('❌ Paybill status error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== GAME BETTING ENDPOINTS ====================
+
+// Place a game bet (Aviator/JetX)
+app.post('/api/games/bet', authenticateToken, async (req, res) => {
+  const { userId, gameType, stake, autoCashout } = req.body;
+  
+  try {
+    console.log('🎲 Placing game bet:', { userId, gameType, stake });
+    
+    // Verify user
+    if (req.user.userId !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    // Validate stake
+    if (stake < 10 || stake > 5000) {
+      return res.status(400).json({ error: 'Stake must be between KES 10 and 5,000' });
+    }
+    
+    // Check user balance
+    const wallet = await pool.query(
+      'SELECT main_balance FROM wallets WHERE user_id = $1',
+      [userId]
+    );
+    
+    if (wallet.rows.length === 0) {
+      return res.status(404).json({ error: 'Wallet not found' });
+    }
+    
+    const currentBalance = parseFloat(wallet.rows[0].main_balance);
+    
+    if (currentBalance < stake) {
+      return res.status(400).json({ 
+        error: 'Insufficient balance',
+        available: currentBalance,
+        required: stake
+      });
+    }
+    
+    // Start transaction
+    await pool.query('BEGIN');
+    
+    // Create bet record
+    const betResult = await pool.query(
+      `INSERT INTO bets (
+        user_id, 
+        selections, 
+        stake, 
+        total_odds, 
+        potential_winnings,
+        status, 
+        bet_type, 
+        game_type,
+        reference_number,
+        created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+      RETURNING id`,
+      [
+        userId,
+        JSON.stringify([{ game: gameType, multiplier: 1.0 }]),
+        stake,
+        1.0,
+        stake * (autoCashout || 1.0),
+        'pending',
+        'single',
+        gameType,
+        `${gameType}-${Date.now()}-${Math.floor(Math.random() * 1000)}`
+      ]
+    );
+    
+    const betId = betResult.rows[0].id;
+    
+    // Deduct from wallet
+    await pool.query(
+      `UPDATE wallets 
+       SET main_balance = main_balance - $1,
+           lifetime_bets = lifetime_bets + $1,
+           last_updated = NOW()
+       WHERE user_id = $2`,
+      [stake, userId]
+    );
+    
+    // Create transaction record
+    await pool.query(
+      `INSERT INTO transactions (
+        user_id, type, amount, status, description, 
+        reference, balance_before, balance_after
+      ) VALUES ($1, 'bet', $2, 'completed', $3, $4, $5, $6)`,
+      [
+        userId,
+        stake,
+        `${gameType} bet placed`,
+        `BET-${betId}`,
+        currentBalance,
+        currentBalance - stake
+      ]
+    );
+    
+    await pool.query('COMMIT');
+    
+    console.log(`✅ Bet placed: User ${userId} bet KES ${stake} on ${gameType}`);
+    
+    res.json({
+      success: true,
+      betId,
+      message: 'Bet placed successfully',
+      newBalance: currentBalance - stake
+    });
+    
+  } catch (error) {
+    await pool.query('ROLLBACK');
+    console.error('❌ Game bet error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Cashout from game
+app.post('/api/games/cashout', authenticateToken, async (req, res) => {
+  const { betId, userId, multiplier } = req.body;
+  
+  try {
+    console.log('💰 Processing cashout:', { betId, userId, multiplier });
+    
+    // Verify user
+    if (req.user.userId !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    // Get bet details
+    const bet = await pool.query(
+      'SELECT * FROM bets WHERE id = $1 AND user_id = $2 AND status = $3',
+      [betId, userId, 'pending']
+    );
+    
+    if (bet.rows.length === 0) {
+      return res.status(404).json({ error: 'Bet not found or already settled' });
+    }
+    
+    const betData = bet.rows[0];
+    const winAmount = betData.stake * multiplier;
+    
+    // Start transaction
+    await pool.query('BEGIN');
+    
+    // Update bet
+    await pool.query(
+      `UPDATE bets 
+       SET status = 'cashed_out', 
+           cashout_multiplier = $1,
+           actual_winnings = $2,
+           settled_at = NOW()
+       WHERE id = $3`,
+      [multiplier, winAmount, betId]
+    );
+    
+    // Get current balance
+    const wallet = await pool.query(
+      'SELECT main_balance FROM wallets WHERE user_id = $1',
+      [userId]
+    );
+    
+    const currentBalance = parseFloat(wallet.rows[0].main_balance);
+    
+    // Add winnings to wallet
+    await pool.query(
+      `UPDATE wallets 
+       SET main_balance = main_balance + $1,
+           lifetime_winnings = lifetime_winnings + $1,
+           last_updated = NOW()
+       WHERE user_id = $2`,
+      [winAmount, userId]
+    );
+    
+    // Create win transaction
+    await pool.query(
+      `INSERT INTO transactions (
+        user_id, type, amount, status, description, 
+        reference, balance_before, balance_after
+      ) VALUES ($1, 'win', $2, 'completed', $3, $4, $5, $6)`,
+      [
+        userId,
+        winAmount,
+        `Cashed out at ${multiplier}x`,
+        `WIN-${betId}`,
+        currentBalance,
+        currentBalance + winAmount
+      ]
+    );
+    
+    await pool.query('COMMIT');
+    
+    console.log(`✅ Cashout processed: User ${userId} won KES ${winAmount} at ${multiplier}x`);
+    
+    res.json({
+      success: true,
+      winAmount,
+      message: `Cashed out at ${multiplier}x! You won KES ${winAmount}`,
+      newBalance: currentBalance + winAmount
+    });
+    
+  } catch (error) {
+    await pool.query('ROLLBACK');
+    console.error('❌ Cashout error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get game history
+app.get('/api/games/history/:gameType', async (req, res) => {
+  const { gameType } = req.params;
+  const limit = parseInt(req.query.limit) || 20;
+  
+  try {
+    const history = await pool.query(
+      `SELECT round_number, crash_point, created_at 
+       FROM game_rounds 
+       WHERE game = $1 AND status = 'completed'
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [gameType, limit]
+    );
+    
+    res.json(history.rows);
+    
+  } catch (error) {
+    console.error('❌ Game history error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== PAYBILL PAYMENT ENDPOINTS ====================
+
+// Initiate Paybill payment
+app.post('/api/payments/paybill/initiate', authenticateToken, async (req, res) => {
+  const { userId, phoneNumber, amount } = req.body;
+  
+  try {
+    console.log('💰 Paybill initiation for user:', userId);
+    
+    // Verify user matches token
+    if (req.user.userId !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    // Check if user has a pending Paybill payment
+    const pendingPayment = await pool.query(
+      `SELECT id FROM paybill_payments 
+       WHERE user_id = $1 AND status = 'pending' AND expires_at > NOW()`,
+      [userId]
+    );
+    
+    if (pendingPayment.rows.length > 0) {
+      return res.json({
+        success: true,
+        message: 'You have a pending Paybill payment',
+        paymentId: pendingPayment.rows[0].id,
+        pending: true
+      });
+    }
+    
+    // Generate unique account number
+    const accountNumber = `LB${Date.now().toString().slice(-8)}${Math.floor(Math.random() * 100)}`;
+    
+    // Create pending payment record
+    const result = await pool.query(
+      `INSERT INTO paybill_payments 
+       (user_id, amount, phone_number, account_number, business_number, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending')
+       RETURNING id, account_number, business_number, expires_at`,
+      [userId, amount, phoneNumber, accountNumber, '4011243']
+    );
+    
+    const payment = result.rows[0];
+    
+    // Create a pending transaction record
+    const transaction = await pool.query(
+      `INSERT INTO transactions 
+       (user_id, type, amount, status, description, method, reference, metadata)
+       VALUES ($1, 'deposit', $2, 'pending', 'Paybill deposit', 'paybill', $3, $4)
+       RETURNING id`,
+      [userId, amount, `PB-${Date.now()}`, JSON.stringify({ paymentId: payment.id })]
+    );
+    
+    // Update payment with transaction ID
+    await pool.query(
+      'UPDATE paybill_payments SET transaction_id = $1 WHERE id = $2',
+      [transaction.rows[0].id, payment.id]
+    );
+    
+    res.json({
+      success: true,
+      paymentId: payment.id,
+      transactionId: transaction.rows[0].id,
+      accountNumber: payment.account_number,
+      businessNumber: payment.business_number,
+      amount,
+      expiresAt: payment.expires_at,
+      instructions: {
+        business: '4011243',
+        account: payment.account_number,
+        amount: amount
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Paybill initiation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Confirm Paybill payment (user clicks "I have paid")
+app.post('/api/payments/paybill/confirm', authenticateToken, async (req, res) => {
+  const { paymentId, confirmationCode } = req.body;
+  
+  try {
+    console.log('💰 Confirming Paybill payment:', paymentId);
+    
+    // Get payment details
+    const payment = await pool.query(
+      `SELECT pp.*, u.full_name 
+       FROM paybill_payments pp
+       JOIN profiles u ON pp.user_id = u.id
+       WHERE pp.id = $1`,
+      [paymentId]
+    );
+    
+    if (payment.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment not found' });
+    }
+    
+    const payData = payment.rows[0];
+    
+    // Verify user owns this payment
+    if (payData.user_id !== req.user.userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    // Check if payment is already confirmed
+    if (payData.status === 'confirmed') {
+      return res.json({
+        success: true,
+        message: 'Payment already confirmed',
+        alreadyConfirmed: true
+      });
+    }
+    
+    // Check if payment has expired
+    if (new Date(payData.expires_at) < new Date()) {
+      await pool.query(
+        'UPDATE paybill_payments SET status = $1 WHERE id = $2',
+        ['expired', paymentId]
+      );
+      return res.status(400).json({ error: 'Payment has expired. Please start a new deposit.' });
+    }
+    
+    // In a real system, you would verify with M-PESA API here
+    // For now, we'll simulate a successful confirmation
+    
+    // Update payment status
+    await pool.query(
+      `UPDATE paybill_payments 
+       SET status = 'confirmed', 
+           confirmed_at = NOW(),
+           confirmation_code = $1
+       WHERE id = $2`,
+      [confirmationCode || `CONF-${Date.now()}`, paymentId]
+    );
+    
+    // Update transaction status to completed
+    await pool.query(
+      `UPDATE transactions 
+       SET status = 'completed', 
+           completed_at = NOW(),
+           description = 'Paybill deposit confirmed'
+       WHERE id = $1`,
+      [payData.transaction_id]
+    );
+    
+    // Update wallet balance
+    await pool.query(
+      `UPDATE wallets 
+       SET main_balance = main_balance + $1,
+           lifetime_deposits = lifetime_deposits + $1,
+           last_updated = NOW()
+       WHERE user_id = $2`,
+      [payData.amount, payData.user_id]
+    );
+    
+    // Create notification (optional)
+    console.log(`✅ Payment confirmed for user ${payData.user_id}: +KES ${payData.amount}`);
+    
+    res.json({
+      success: true,
+      message: 'Payment confirmed successfully',
+      amount: payData.amount
+    });
+    
+  } catch (error) {
+    console.error('❌ Paybill confirmation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Check Paybill payment status
+app.get('/api/payments/paybill/status/:paymentId', authenticateToken, async (req, res) => {
+  const { paymentId } = req.params;
+  
+  try {
+    const payment = await pool.query(
+      `SELECT pp.*, t.status as transaction_status
+       FROM paybill_payments pp
+       LEFT JOIN transactions t ON pp.transaction_id = t.id
+       WHERE pp.id = $1`,
+      [paymentId]
+    );
+    
+    if (payment.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment not found' });
+    }
+    
+    const payData = payment.rows[0];
+    
+    // Verify user owns this payment
+    if (payData.user_id !== req.user.userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    res.json({
+      status: payData.status,
+      amount: payData.amount,
+      expiresAt: payData.expires_at,
+      transactionStatus: payData.transaction_status
+    });
+    
+  } catch (error) {
+    console.error('❌ Paybill status error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== GAME BETTING ENDPOINTS ====================
+
+// Place a game bet (Aviator/JetX)
+app.post('/api/games/bet', authenticateToken, async (req, res) => {
+  const { userId, gameType, stake, autoCashout } = req.body;
+  
+  try {
+    console.log('🎲 Placing game bet:', { userId, gameType, stake });
+    
+    // Verify user
+    if (req.user.userId !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    // Validate stake
+    if (stake < 10 || stake > 5000) {
+      return res.status(400).json({ error: 'Stake must be between KES 10 and 5,000' });
+    }
+    
+    // Check user balance
+    const wallet = await pool.query(
+      'SELECT main_balance FROM wallets WHERE user_id = $1',
+      [userId]
+    );
+    
+    if (wallet.rows.length === 0) {
+      return res.status(404).json({ error: 'Wallet not found' });
+    }
+    
+    const currentBalance = parseFloat(wallet.rows[0].main_balance);
+    
+    if (currentBalance < stake) {
+      return res.status(400).json({ 
+        error: 'Insufficient balance',
+        available: currentBalance,
+        required: stake
+      });
+    }
+    
+    // Start transaction
+    await pool.query('BEGIN');
+    
+    // Create bet record
+    const betResult = await pool.query(
+      `INSERT INTO bets (
+        user_id, 
+        selections, 
+        stake, 
+        total_odds, 
+        potential_winnings,
+        status, 
+        bet_type, 
+        game_type,
+        reference_number,
+        created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+      RETURNING id`,
+      [
+        userId,
+        JSON.stringify([{ game: gameType, multiplier: 1.0 }]),
+        stake,
+        1.0,
+        stake * (autoCashout || 1.0),
+        'pending',
+        'single',
+        gameType,
+        `${gameType}-${Date.now()}-${Math.floor(Math.random() * 1000)}`
+      ]
+    );
+    
+    const betId = betResult.rows[0].id;
+    
+    // Deduct from wallet
+    await pool.query(
+      `UPDATE wallets 
+       SET main_balance = main_balance - $1,
+           lifetime_bets = lifetime_bets + $1,
+           last_updated = NOW()
+       WHERE user_id = $2`,
+      [stake, userId]
+    );
+    
+    // Create transaction record
+    await pool.query(
+      `INSERT INTO transactions (
+        user_id, type, amount, status, description, 
+        reference, balance_before, balance_after
+      ) VALUES ($1, 'bet', $2, 'completed', $3, $4, $5, $6)`,
+      [
+        userId,
+        stake,
+        `${gameType} bet placed`,
+        `BET-${betId}`,
+        currentBalance,
+        currentBalance - stake
+      ]
+    );
+    
+    await pool.query('COMMIT');
+    
+    console.log(`✅ Bet placed: User ${userId} bet KES ${stake} on ${gameType}`);
+    
+    res.json({
+      success: true,
+      betId,
+      message: 'Bet placed successfully',
+      newBalance: currentBalance - stake
+    });
+    
+  } catch (error) {
+    await pool.query('ROLLBACK');
+    console.error('❌ Game bet error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Cashout from game
+app.post('/api/games/cashout', authenticateToken, async (req, res) => {
+  const { betId, userId, multiplier } = req.body;
+  
+  try {
+    console.log('💰 Processing cashout:', { betId, userId, multiplier });
+    
+    // Verify user
+    if (req.user.userId !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    // Get bet details
+    const bet = await pool.query(
+      'SELECT * FROM bets WHERE id = $1 AND user_id = $2 AND status = $3',
+      [betId, userId, 'pending']
+    );
+    
+    if (bet.rows.length === 0) {
+      return res.status(404).json({ error: 'Bet not found or already settled' });
+    }
+    
+    const betData = bet.rows[0];
+    const winAmount = betData.stake * multiplier;
+    
+    // Start transaction
+    await pool.query('BEGIN');
+    
+    // Update bet
+    await pool.query(
+      `UPDATE bets 
+       SET status = 'cashed_out', 
+           cashout_multiplier = $1,
+           actual_winnings = $2,
+           settled_at = NOW()
+       WHERE id = $3`,
+      [multiplier, winAmount, betId]
+    );
+    
+    // Get current balance
+    const wallet = await pool.query(
+      'SELECT main_balance FROM wallets WHERE user_id = $1',
+      [userId]
+    );
+    
+    const currentBalance = parseFloat(wallet.rows[0].main_balance);
+    
+    // Add winnings to wallet
+    await pool.query(
+      `UPDATE wallets 
+       SET main_balance = main_balance + $1,
+           lifetime_winnings = lifetime_winnings + $1,
+           last_updated = NOW()
+       WHERE user_id = $2`,
+      [winAmount, userId]
+    );
+    
+    // Create win transaction
+    await pool.query(
+      `INSERT INTO transactions (
+        user_id, type, amount, status, description, 
+        reference, balance_before, balance_after
+      ) VALUES ($1, 'win', $2, 'completed', $3, $4, $5, $6)`,
+      [
+        userId,
+        winAmount,
+        `Cashed out at ${multiplier}x`,
+        `WIN-${betId}`,
+        currentBalance,
+        currentBalance + winAmount
+      ]
+    );
+    
+    await pool.query('COMMIT');
+    
+    console.log(`✅ Cashout processed: User ${userId} won KES ${winAmount} at ${multiplier}x`);
+    
+    res.json({
+      success: true,
+      winAmount,
+      message: `Cashed out at ${multiplier}x! You won KES ${winAmount}`,
+      newBalance: currentBalance + winAmount
+    });
+    
+  } catch (error) {
+    await pool.query('ROLLBACK');
+    console.error('❌ Cashout error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/games/history/:gameType', async (req, res) => {
+  const { gameType } = req.params;
+  const limit = parseInt(req.query.limit) || 20;  // Removed 'as string'
+  
+  try {
+    const history = await pool.query(
+      `SELECT round_number, crash_point, created_at 
+       FROM game_rounds 
+       WHERE game = $1 AND status = 'completed'
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [gameType, limit]
+    );
+    
+    res.json(history.rows);
+    
+  } catch (error) {
+    console.error('❌ Game history error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 // ==================== FAQ ENDPOINT ====================
 
 // Get FAQs
