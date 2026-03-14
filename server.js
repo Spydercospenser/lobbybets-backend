@@ -1039,18 +1039,19 @@ app.post('/api/register', async (req, res) => {
     
     const userId = userResult.rows[0].id;
     
+    // ✅ FIXED: Remove non-existent columns (bonus_balance, affiliate_balance)
     await client.query(
       `INSERT INTO wallets 
-       (user_id, main_balance, bonus_balance, affiliate_balance, lifetime_deposits, created_at, updated_at) 
-       VALUES ($1, 100, 0, 0, 0, NOW(), NOW())`,
+       (user_id, main_balance, lifetime_deposits, created_at, updated_at) 
+       VALUES ($1, 100, 100, NOW(), NOW())`,
       [userId]
     );
     
-    // FIXED: Removed 'profit' column - it doesn't exist!
+    // Add transaction record for the welcome bonus
     await client.query(
       `INSERT INTO transactions 
-       (user_id, type, amount, status, description, reference, balance_before, balance_after, created_at)
-       VALUES ($1, 'bonus', 100, 'completed', 'Welcome Bonus', $2, 0, 100, NOW())`,
+       (user_id, type, amount, status, description, reference, balance_before, balance_after, created_at, profit)
+       VALUES ($1, 'bonus', 100, 'completed', 'Welcome Bonus', $2, 0, 100, NOW(), 100)`,
       [userId, 'BONUS-' + Date.now()]
     );
     
@@ -1068,6 +1069,7 @@ app.post('/api/register', async (req, res) => {
     );
     
     console.log('✅ User registered successfully:', userId);
+    console.log('💰 Welcome bonus of 100 KES added to wallet');
     
     res.json({ 
       success: true, 
