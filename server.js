@@ -2829,7 +2829,6 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     }
     
     const currentBalance = parseFloat(wallet.rows[0].main_balance);
-    const currentProfit = parseFloat(wallet.rows[0].total_profit);
     
     if (currentBalance < numericStake) {
       await client.query('ROLLBACK');
@@ -2862,29 +2861,27 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
       // Calculate next round number
       const nextRoundNumber = (parseInt(maxRoundResult.rows[0].max_round) || 0) + 1;
       
-      // ==================== FIXED: Added the third parameter ====================
-      // Before: VALUES ($1, $2, 'waiting', NOW()) with [gameType, nextRoundNumber] - 2 params, 3 placeholders!
-      // After: VALUES ($1, $2, $3, NOW()) with [gameType, nextRoundNumber, 'waiting'] - 3 params, 3 placeholders!
+      // FIX: Use UUID generation in PostgreSQL
       const newRound = await client.query(
-        `INSERT INTO game_rounds (game, round_number, status, started_at)
-         VALUES ($1, $2, $3, NOW())
+        `INSERT INTO game_rounds (id, game, round_number, status, started_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, NOW())
          RETURNING id, round_number`,
-        [gameType, nextRoundNumber, 'waiting']  // <--- 3 parameters now!
+        [gameType, nextRoundNumber, 'waiting']
       );
       
-      roundId = newRound.rows[0].id;
+      roundId = newRound.rows[0].id;  // This is now a UUID string
       roundNumber = newRound.rows[0].round_number;
-      console.log(`🆕 Created new round #${roundNumber} for ${gameType} (status: waiting)`);
+      console.log(`🆕 Created new round #${roundNumber} with UUID: ${roundId}`);
     } else {
-      roundId = roundResult.rows[0].id;
+      roundId = roundResult.rows[0].id;  // This is UUID
       roundNumber = roundResult.rows[0].round_number;
-      console.log(`🔄 Using existing round #${roundNumber} for ${gameType} (status: ${roundResult.rows[0].status})`);
+      console.log(`🔄 Using existing round #${roundNumber} with UUID: ${roundId}`);
     }
     
     // Generate unique reference number
     const referenceNumber = `${gameType}-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
     
-    // Insert bet
+    // Insert bet - round_id is UUID, pass as string
     const betResult = await client.query(
       `INSERT INTO bets (
         user_id, selections, stake, total_odds, potential_winnings,
@@ -2900,7 +2897,7 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
         'pending',
         'single',
         gameType,
-        roundId,
+        roundId,  // This is now UUID string
         referenceNumber,
         -numericStake
       ]
@@ -2933,13 +2930,17 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
       `INSERT INTO transactions (
         user_id, type, amount, status, description, reference, 
         balance_before, balance_after, profit, created_at
-      ) VALUES ($1, 'bet', $2, 'completed', $3, $4, $5, $5 - $2, -$2, NOW())`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
       [
         numericUserId,
+        'bet',
         numericStake,
+        'completed',
         `${gameType} bet placed`,
         `BET-${betId}`,
-        currentBalance
+        currentBalance,
+        currentBalance - numericStake,
+        -numericStake
       ]
     );
     
@@ -2952,6 +2953,7 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     );
     
     console.log(`✅ Bet placed: User ${numericUserId} bet KES ${numericStake} on ${gameType} (Round #${roundNumber})`);
+    console.log(`💰 New balance: ${updatedWallet.rows[0].main_balance}`);
     
     res.json({
       success: true,
