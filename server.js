@@ -63,7 +63,7 @@ const corsOptions = {
     callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Cache-Control', 'Pragma', 'Expires'],  // <-- ADDED Cache-Control
   exposedHeaders: ['Content-Range', 'X-Content-Range'],
   credentials: true,
   optionsSuccessStatus: 200,
@@ -678,6 +678,19 @@ const generateTimestamp = () => {
   const minutes = String(date.getMinutes()).padStart(2, '0');
   const seconds = String(date.getSeconds()).padStart(2, '0');
   return `${year}${month}${day}${hours}${minutes}${seconds}`;
+};
+
+// ==================== DEFAULT GAME STATS ====================
+const defaultGameStats = {
+  totalBets: 0,
+  totalWins: 0,
+  totalLosses: 0,
+  totalWagered: 0,
+  totalWon: 0,
+  totalProfit: 0,
+  biggestWin: 0,
+  biggestMultiplier: 0,
+  lastPlayed: null
 };
 
 // ==================== M-PESA CONFIGURATION ====================
@@ -1327,7 +1340,115 @@ app.post('/api/profile/remove-image', authenticateToken, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
+// ==================== ADD THIS TO SERVER.JS ====================
+app.post('/api/games/cashout', authenticateToken, async (req, res) => {
+  const { betId, userId, multiplier } = req.body;
+  
+  let client;
+  
+  try {
+    console.log('💰 Cashing out:', { betId, userId, multiplier });
+    
+    if (req.user.userId !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    client = await pool.connect();
+    await client.query('BEGIN');
+    
+    // Get bet with lock
+    const betResult = await client.query(
+      `SELECT * FROM bets 
+       WHERE id = $1 AND user_id = $2 AND game_type IN ('aviator', 'jetx') 
+       FOR UPDATE`,
+      [betId, userId]
+    );
+    
+    if (betResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Bet not found' });
+    }
+    
+    const bet = betResult.rows[0];
+    
+    if (bet.status !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Bet already ${bet.status}` });
+    }
+    
+    // Calculate winnings
+    const stake = parseFloat(bet.stake);
+    const winnings = stake * multiplier;
+    const profit = winnings - stake;
+    
+    // Update bet
+    await client.query(
+      `UPDATE bets 
+       SET status = 'cashed_out',
+           cashout_multiplier = $1,
+           actual_winnings = $2,
+           profit = $3,
+           settled_at = NOW()
+       WHERE id = $4`,
+      [multiplier, winnings, profit, betId]
+    );
+    
+    // Update wallet - ADD WINNINGS
+    await client.query(
+      `UPDATE wallets 
+       SET main_balance = main_balance + $1,
+           total_profit = total_profit + $2,
+           lifetime_winnings = lifetime_winnings + $3,
+           updated_at = NOW()
+       WHERE user_id = $4`,
+      [winnings, profit, winnings, userId]
+    );
+    
+    // Get current balance
+    const walletResult = await client.query(
+      `SELECT main_balance FROM wallets WHERE user_id = $1`,
+      [userId]
+    );
+    const currentBalance = parseFloat(walletResult.rows[0].main_balance);
+    const balanceBefore = currentBalance - winnings;
+    
+    // Record transaction
+    await client.query(
+      `INSERT INTO transactions (
+        user_id, type, amount, status, description, reference, 
+        balance_before, balance_after, profit
+      ) VALUES ($1, 'win', $2, 'completed', $3, $4, $5, $6, $7)`,
+      [
+        userId,
+        winnings,
+        `Aviator cashout at ${multiplier}x`,
+        `CASHOUT-${betId}`,
+        balanceBefore,
+        currentBalance,
+        profit
+      ]
+    );
+    
+    await client.query('COMMIT');
+    
+    res.json({
+      success: true,
+      betId,
+      multiplier,
+      stake,
+      winnings,
+      profit,
+      newBalance: currentBalance
+    });
+    
+  } catch (error) {
+    if (client) await client.query('ROLLBACK');
+    console.error('❌ Cashout error:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (client) client.release();
+  }
+});
 // ==================== WALLET ENDPOINTS ====================
 app.get('/api/wallet/:userId', authenticateToken, async (req, res) => {
   try {
@@ -2669,20 +2790,37 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
   try {
     console.log('🎲 Placing game bet:', { userId, gameType, stake });
     
+    // Validate user authorization
     if (req.user.userId !== userId) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
     
+    // Validate stake
     if (stake < 10 || stake > 5000) {
       return res.status(400).json({ error: 'Stake must be between KES 10 and 5,000' });
+    }
+    
+    // Validate game type
+    if (!['aviator', 'jetx'].includes(gameType)) {
+      return res.status(400).json({ error: 'Invalid game type' });
+    }
+    
+    // Convert to proper types
+    const numericUserId = parseInt(userId);
+    const numericStake = parseFloat(stake);
+    const numericAutoCashout = autoCashout ? parseFloat(autoCashout) : null;
+    
+    if (isNaN(numericUserId) || isNaN(numericStake)) {
+      return res.status(400).json({ error: 'Invalid number format' });
     }
     
     client = await pool.connect();
     await client.query('BEGIN');
     
+    // Check wallet balance
     const wallet = await client.query(
       'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
-      [userId]
+      [numericUserId]
     );
     
     if (wallet.rows.length === 0) {
@@ -2693,37 +2831,60 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     const currentBalance = parseFloat(wallet.rows[0].main_balance);
     const currentProfit = parseFloat(wallet.rows[0].total_profit);
     
-    if (currentBalance < stake) {
+    if (currentBalance < numericStake) {
       await client.query('ROLLBACK');
       return res.status(400).json({ 
         error: 'Insufficient balance',
         available: currentBalance,
-        required: stake
+        required: numericStake
       });
     }
     
+    // Look for waiting OR flying rounds
     let roundResult = await client.query(
       `SELECT * FROM game_rounds 
-       WHERE game = $1 AND status = 'flying' 
+       WHERE game = $1 AND status IN ('waiting', 'flying')
        ORDER BY created_at DESC 
        LIMIT 1`,
       [gameType]
     );
     
     let roundId;
+    let roundNumber;
     
     if (roundResult.rows.length === 0) {
-      const newRound = await client.query(
-        `INSERT INTO game_rounds (game, round_number, status, started_at)
-         VALUES ($1, COALESCE((SELECT MAX(round_number) + 1 FROM game_rounds WHERE game = $1), 1), 'flying', NOW())
-         RETURNING id`,
+      // Get the maximum round number for this game
+      const maxRoundResult = await client.query(
+        `SELECT COALESCE(MAX(round_number), 0) as max_round FROM game_rounds WHERE game = $1`,
         [gameType]
       );
+      
+      // Calculate next round number
+      const nextRoundNumber = (parseInt(maxRoundResult.rows[0].max_round) || 0) + 1;
+      
+      // ==================== FIXED: Added the third parameter ====================
+      // Before: VALUES ($1, $2, 'waiting', NOW()) with [gameType, nextRoundNumber] - 2 params, 3 placeholders!
+      // After: VALUES ($1, $2, $3, NOW()) with [gameType, nextRoundNumber, 'waiting'] - 3 params, 3 placeholders!
+      const newRound = await client.query(
+        `INSERT INTO game_rounds (game, round_number, status, started_at)
+         VALUES ($1, $2, $3, NOW())
+         RETURNING id, round_number`,
+        [gameType, nextRoundNumber, 'waiting']  // <--- 3 parameters now!
+      );
+      
       roundId = newRound.rows[0].id;
+      roundNumber = newRound.rows[0].round_number;
+      console.log(`🆕 Created new round #${roundNumber} for ${gameType} (status: waiting)`);
     } else {
       roundId = roundResult.rows[0].id;
+      roundNumber = roundResult.rows[0].round_number;
+      console.log(`🔄 Using existing round #${roundNumber} for ${gameType} (status: ${roundResult.rows[0].status})`);
     }
     
+    // Generate unique reference number
+    const referenceNumber = `${gameType}-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+    
+    // Insert bet
     const betResult = await client.query(
       `INSERT INTO bets (
         user_id, selections, stake, total_odds, potential_winnings,
@@ -2731,22 +2892,23 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
       RETURNING id`,
       [
-        userId,
+        numericUserId,
         JSON.stringify([{ game: gameType, multiplier: 1.0 }]),
-        stake,
+        numericStake,
         1.0,
-        stake * (autoCashout || 1.0),
+        numericStake * (numericAutoCashout || 1.0),
         'pending',
         'single',
         gameType,
         roundId,
-        `${gameType}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-        -stake
+        referenceNumber,
+        -numericStake
       ]
     );
     
     const betId = betResult.rows[0].id;
     
+    // Update wallet - deduct stake
     await client.query(
       `UPDATE wallets 
        SET main_balance = main_balance - $1,
@@ -2754,25 +2916,27 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
            total_profit = total_profit - $1,
            updated_at = NOW()
        WHERE user_id = $2`,
-      [stake, userId]
+      [numericStake, numericUserId]
     );
     
+    // Update game round stats
     await client.query(
       `UPDATE game_rounds 
        SET total_bets = total_bets + 1,
            total_wagered = total_wagered + $1
        WHERE id = $2`,
-      [stake, roundId]
+      [numericStake, roundId]
     );
     
+    // Record transaction
     await client.query(
       `INSERT INTO transactions (
         user_id, type, amount, status, description, reference, 
         balance_before, balance_after, profit, created_at
       ) VALUES ($1, 'bet', $2, 'completed', $3, $4, $5, $5 - $2, -$2, NOW())`,
       [
-        userId,
-        stake,
+        numericUserId,
+        numericStake,
         `${gameType} bet placed`,
         `BET-${betId}`,
         currentBalance
@@ -2781,17 +2945,19 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     
     await client.query('COMMIT');
     
+    // Get updated wallet balance
     const updatedWallet = await pool.query(
       'SELECT main_balance, total_profit FROM wallets WHERE user_id = $1',
-      [userId]
+      [numericUserId]
     );
     
-    console.log(`✅ Bet placed: User ${userId} bet KES ${stake} on ${gameType}`);
+    console.log(`✅ Bet placed: User ${numericUserId} bet KES ${numericStake} on ${gameType} (Round #${roundNumber})`);
     
     res.json({
       success: true,
       betId,
       roundId,
+      roundNumber,
       message: 'Bet placed successfully',
       newBalance: updatedWallet.rows[0].main_balance,
       newProfit: updatedWallet.rows[0].total_profit,
@@ -2804,151 +2970,13 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
       client.release();
     }
     console.error('❌ Game bet error:', error);
-    res.status(500).json({ error: error.message });
-  } finally {
-    if (client) client.release();
-  }
-});
-
-app.post('/api/games/cashout', authenticateToken, async (req, res) => {
-  const { betId, userId, multiplier } = req.body;
-  
-  let client;
-  
-  try {
-    console.log('💰 Processing cashout:', { betId, userId, multiplier });
-    
-    if (req.user.userId !== userId) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
-    
-    if (multiplier < 1.0) {
-      return res.status(400).json({ error: 'Invalid multiplier' });
-    }
-    
-    client = await pool.connect();
-    await client.query('BEGIN');
-    
-    const bet = await client.query(
-      'SELECT * FROM bets WHERE id = $1 AND user_id = $2 AND status = $3 FOR UPDATE',
-      [betId, userId, 'pending']
-    );
-    
-    if (bet.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Bet not found or already settled' });
-    }
-    
-    const betData = bet.rows[0];
-    const stake = parseFloat(betData.stake);
-    const winAmount = stake * multiplier;
-    const profit = winAmount - stake;
-    
-    await client.query(
-      `UPDATE bets 
-       SET status = 'cashed_out', 
-           cashout_multiplier = $1,
-           actual_winnings = $2,
-           profit = $3,
-           settled_at = NOW()
-       WHERE id = $4`,
-      [multiplier, winAmount, profit, betId]
-    );
-    
-    const wallet = await client.query(
-      'SELECT main_balance, total_profit FROM wallets WHERE user_id = $1 FOR UPDATE',
-      [userId]
-    );
-    
-    if (wallet.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Wallet not found' });
-    }
-    
-    const currentBalance = parseFloat(wallet.rows[0].main_balance);
-    const currentProfit = parseFloat(wallet.rows[0].total_profit);
-    const newBalance = currentBalance + winAmount;
-    const newProfit = currentProfit + profit;
-    
-    await client.query(
-      `UPDATE wallets 
-       SET main_balance = main_balance + $1,
-           lifetime_winnings = lifetime_winnings + $1,
-           total_profit = total_profit + $2,
-           updated_at = NOW()
-       WHERE user_id = $3`,
-      [winAmount, profit, userId]
-    );
-    
-    await client.query(
-      `UPDATE game_rounds 
-       SET total_paid = COALESCE(total_paid, 0) + $1,
-           total_bets_settled = COALESCE(total_bets_settled, 0) + 1,
-           house_profit = house_profit - $2
-       WHERE id = $3`,
-      [winAmount, profit, betData.round_id]
-    );
-    
-    await client.query(
-      `INSERT INTO transactions (
-        user_id, type, amount, status, description, reference, 
-        balance_before, balance_after, profit, created_at
-      ) VALUES ($1, 'win', $2, 'completed', $3, $4, $5, $6, $7, NOW())`,
-      [
-        userId,
-        winAmount,
-        `Cashed out at ${multiplier}x on Aviator`,
-        `WIN-${betId}-${Date.now()}`,
-        currentBalance,
-        newBalance,
-        profit
-      ]
-    );
-    
-    await client.query('COMMIT');
-    
-    console.log(`✅ Cashout processed: User ${userId} won KES ${winAmount} at ${multiplier}x (Profit: KES ${profit})`);
-    
-    res.json({
-      success: true,
-      winAmount,
-      profit,
-      message: `Cashed out at ${multiplier}x! You won KES ${winAmount}`,
-      newBalance,
-      newProfit
+    console.error('Error details:', error.message);
+    res.status(500).json({ 
+      error: 'Failed to place bet',
+      details: error.message 
     });
-    
-  } catch (error) {
-    if (client) {
-      await client.query('ROLLBACK');
-      client.release();
-    }
-    console.error('❌ Cashout error:', error);
-    res.status(500).json({ error: error.message });
   } finally {
     if (client) client.release();
-  }
-});
-
-app.get('/api/games/history/:gameType', async (req, res) => {
-  const { gameType } = req.params;
-  const limit = parseInt(req.query.limit) || 20;
-  
-  try {
-    const history = await pool.query(
-      `SELECT round_number, crash_point, created_at 
-       FROM game_rounds 
-       WHERE game = $1 AND status = 'completed'
-       ORDER BY created_at DESC
-       LIMIT $2`,
-      [gameType, limit]
-    );
-    
-    res.json(history.rows);
-    
-  } catch (error) {
-    console.error('❌ Game history error:', error);
-    res.status(500).json({ error: error.message });
   }
 });
 
