@@ -1340,7 +1340,7 @@ app.post('/api/profile/remove-image', authenticateToken, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-// ==================== ADD THIS TO SERVER.JS ====================
+// ==================== GAME CASHOUT ====================
 app.post('/api/games/cashout', authenticateToken, async (req, res) => {
   const { betId, userId, multiplier } = req.body;
   
@@ -1353,6 +1353,34 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized' });
     }
     
+    // Handle string bet IDs (like "pending_xxx") by looking up the actual bet
+    let numericBetId;
+    
+    if (typeof betId === 'string' && betId.includes('pending_')) {
+      console.log('⚠️ Received pending bet ID, looking up actual bet...');
+      
+      // Find the most recent pending bet for this user in the current game
+      const betLookup = await pool.query(
+        `SELECT id FROM bets 
+         WHERE user_id = $1 AND status = 'pending' AND game_type IN ('aviator', 'jetx')
+         ORDER BY created_at DESC LIMIT 1`,
+        [userId]
+      );
+      
+      if (betLookup.rows.length === 0) {
+        return res.status(404).json({ error: 'No active bet found for cashout' });
+      }
+      
+      numericBetId = betLookup.rows[0].id;
+      console.log(`✅ Found actual bet ID: ${numericBetId}`);
+    } else {
+      numericBetId = parseInt(betId);
+    }
+    
+    if (isNaN(numericBetId)) {
+      return res.status(400).json({ error: 'Invalid bet ID format' });
+    }
+    
     client = await pool.connect();
     await client.query('BEGIN');
     
@@ -1361,7 +1389,7 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
       `SELECT * FROM bets 
        WHERE id = $1 AND user_id = $2 AND game_type IN ('aviator', 'jetx') 
        FOR UPDATE`,
-      [betId, userId]
+      [numericBetId, userId]
     );
     
     if (betResult.rows.length === 0) {
@@ -1390,7 +1418,7 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
            profit = $3,
            settled_at = NOW()
        WHERE id = $4`,
-      [multiplier, winnings, profit, betId]
+      [multiplier, winnings, profit, numericBetId]
     );
     
     // Update wallet - ADD WINNINGS
@@ -1421,8 +1449,8 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
       [
         userId,
         winnings,
-        `Aviator cashout at ${multiplier}x`,
-        `CASHOUT-${betId}`,
+        `${bet.game_type || 'Aviator'} cashout at ${multiplier}x`,
+        `CASHOUT-${numericBetId}`,
         balanceBefore,
         currentBalance,
         profit
@@ -1431,9 +1459,11 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
     
     await client.query('COMMIT');
     
+    console.log(`✅ Cashout successful: User ${userId} won KES ${winnings} at ${multiplier}x`);
+    
     res.json({
       success: true,
-      betId,
+      betId: numericBetId,
       multiplier,
       stake,
       winnings,
@@ -1442,7 +1472,10 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
     });
     
   } catch (error) {
-    if (client) await client.query('ROLLBACK');
+    if (client) {
+      await client.query('ROLLBACK');
+      client.release();
+    }
     console.error('❌ Cashout error:', error);
     res.status(500).json({ error: error.message });
   } finally {
