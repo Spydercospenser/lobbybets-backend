@@ -2861,27 +2861,27 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
       // Calculate next round number
       const nextRoundNumber = (parseInt(maxRoundResult.rows[0].max_round) || 0) + 1;
       
-      // FIX: Use UUID generation in PostgreSQL
+      // CORRECTED: Use INTEGER ID (SERIAL auto-increment) - NOT UUID
       const newRound = await client.query(
-        `INSERT INTO game_rounds (id, game, round_number, status, started_at)
-         VALUES (gen_random_uuid(), $1, $2, $3, NOW())
+        `INSERT INTO game_rounds (game, round_number, status, started_at)
+         VALUES ($1, $2, $3, NOW())
          RETURNING id, round_number`,
         [gameType, nextRoundNumber, 'waiting']
       );
       
-      roundId = newRound.rows[0].id;  // This is now a UUID string
+      roundId = newRound.rows[0].id;  // This is INTEGER
       roundNumber = newRound.rows[0].round_number;
-      console.log(`🆕 Created new round #${roundNumber} with UUID: ${roundId}`);
+      console.log(`🆕 Created new round #${roundNumber} with ID: ${roundId}`);
     } else {
-      roundId = roundResult.rows[0].id;  // This is UUID
+      roundId = roundResult.rows[0].id;  // This is INTEGER
       roundNumber = roundResult.rows[0].round_number;
-      console.log(`🔄 Using existing round #${roundNumber} with UUID: ${roundId}`);
+      console.log(`🔄 Using existing round #${roundNumber} with ID: ${roundId}`);
     }
     
     // Generate unique reference number
     const referenceNumber = `${gameType}-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
     
-    // Insert bet - round_id is UUID, pass as string
+    // CORRECTED: Insert bet with INTEGER round_id
     const betResult = await client.query(
       `INSERT INTO bets (
         user_id, selections, stake, total_odds, potential_winnings,
@@ -2897,7 +2897,7 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
         'pending',
         'single',
         gameType,
-        roundId,  // This is now UUID string
+        roundId,  // INTEGER
         referenceNumber,
         -numericStake
       ]
@@ -2981,7 +2981,6 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     if (client) client.release();
   }
 });
-
 // ==================== JACKPOT ====================
 app.post('/api/jackpot/enter', authenticateToken, async (req, res) => {
   const { userId, jackpotId, numbers } = req.body;
