@@ -3046,6 +3046,7 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
       });
     }
     
+    // ========== FIXED: CREATE ROUND WITH FLYING STATUS ==========
     let roundResult = await client.query(
       `SELECT * FROM game_rounds 
        WHERE game = $1 AND status IN ('waiting', 'flying')
@@ -3056,29 +3057,87 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     
     let roundId;
     let roundNumber;
+    let crashPointValue;
     
     if (roundResult.rows.length === 0) {
+      // Create NEW round with FLYING status (not waiting)
       const maxRoundResult = await client.query(
         `SELECT COALESCE(MAX(round_number), 0) as max_round FROM game_rounds WHERE game = $1`,
         [gameType]
       );
       
       const nextRoundNumber = (parseInt(maxRoundResult.rows[0].max_round) || 0) + 1;
+      crashPointValue = generateCrashPoint(); // Use your existing generateCrashPoint function
       
       const newRound = await client.query(
-        `INSERT INTO game_rounds (game, round_number, status, started_at)
-         VALUES ($1, $2, $3, NOW())
-         RETURNING id, round_number`,
-        [gameType, nextRoundNumber, 'waiting']
+        `INSERT INTO game_rounds (game, round_number, crash_point, status, started_at)
+         VALUES ($1, $2, $3, 'flying', NOW())
+         RETURNING id, round_number, crash_point`,
+        [gameType, nextRoundNumber, crashPointValue]
       );
       
       roundId = newRound.rows[0].id;
       roundNumber = newRound.rows[0].round_number;
-      console.log(`🆕 Created new round #${roundNumber} with ID: ${roundId}`);
+      crashPointValue = parseFloat(newRound.rows[0].crash_point);
+      
+      console.log(`🆕 Created NEW flying round #${roundNumber} with ID: ${roundId}, crash at: ${crashPointValue}x`);
+      
+      // Schedule auto-crash for this round
+      const crashDelay = Math.random() * 15000 + 10000; // 10-25 seconds
+      setTimeout(async () => {
+        try {
+          await pool.query(
+            `UPDATE game_rounds 
+             SET status = 'crashed', ended_at = NOW()
+             WHERE id = $1 AND status = 'flying'`,
+            [roundId]
+          );
+          console.log(`💥 Round #${roundNumber} auto-crashed at ${crashPointValue}x`);
+        } catch (err) {
+          console.error('Auto-crash error:', err);
+        }
+      }, crashDelay);
+      
     } else {
       roundId = roundResult.rows[0].id;
       roundNumber = roundResult.rows[0].round_number;
-      console.log(`🔄 Using existing round #${roundNumber} with ID: ${roundId}`);
+      crashPointValue = parseFloat(roundResult.rows[0].crash_point);
+      
+      // If round is waiting, START IT NOW
+      if (roundResult.rows[0].status === 'waiting') {
+        // Generate crash point if not set
+        if (!crashPointValue || crashPointValue === 0) {
+          crashPointValue = generateCrashPoint();
+        }
+        
+        await client.query(
+          `UPDATE game_rounds 
+           SET status = 'flying', 
+               crash_point = $1,
+               started_at = NOW()
+           WHERE id = $2`,
+          [crashPointValue, roundId]
+        );
+        console.log(`✈️ STARTED waiting round #${roundNumber}, crash at: ${crashPointValue}x`);
+        
+        // Schedule auto-crash
+        const crashDelay = Math.random() * 15000 + 10000;
+        setTimeout(async () => {
+          try {
+            await pool.query(
+              `UPDATE game_rounds 
+               SET status = 'crashed', ended_at = NOW()
+               WHERE id = $1 AND status = 'flying'`,
+              [roundId]
+            );
+            console.log(`💥 Round #${roundNumber} auto-crashed at ${crashPointValue}x`);
+          } catch (err) {
+            console.error('Auto-crash error:', err);
+          }
+        }, crashDelay);
+      } else {
+        console.log(`🔄 Using existing flying round #${roundNumber} with ID: ${roundId}`);
+      }
     }
     
     const referenceNumber = `${gameType}-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
@@ -3149,7 +3208,7 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
       [numericUserId]
     );
     
-    console.log(`✅ Bet placed: User ${numericUserId} bet KES ${numericStake} on ${gameType} (Round #${roundNumber})`);
+    console.log(`✅ Bet placed: User ${numericUserId} bet KES ${numericStake} on ${gameType} (Round #${roundNumber} - FLYING)`);
     console.log(`💰 New balance: ${updatedWallet.rows[0].main_balance}`);
     
     res.json({
@@ -3157,6 +3216,7 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
       betId,
       roundId,
       roundNumber,
+      crashPoint: crashPointValue,
       message: 'Bet placed successfully',
       newBalance: updatedWallet.rows[0].main_balance,
       newProfit: updatedWallet.rows[0].total_profit,
@@ -3178,7 +3238,6 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     if (client) client.release();
   }
 });
-
 // ==================== JACKPOT ====================
 app.post('/api/jackpot/enter', authenticateToken, async (req, res) => {
   const { userId, jackpotId, numbers } = req.body;
@@ -4764,13 +4823,47 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
 
 // ==================== FOOTBALL API PROXY ENDPOINTS ====================
 
+const FOOTBALL_API_KEY = '06fd9ad610ba7c51d947ecab06d4f87';
+const FOOTBALL_API_URL = 'https://v3.football.api-sports.io';
+
+// Test endpoint to check API status
+app.get('/api/football/check-status', async (req, res) => {
+  try {
+    const response = await axios.get(`${FOOTBALL_API_URL}/status`, {
+      headers: {
+        'x-apisports-key': FOOTBALL_API_KEY,
+        'x-apisports-host': 'v3.football.api-sports.io'
+      }
+    });
+    
+    const isActive = response.data?.response?.subscription?.active === true;
+    const plan = response.data?.response?.subscription?.plan || 'Unknown';
+    const requestsLeft = response.data?.response?.requests?.left || 'Unknown';
+    
+    res.json({
+      success: true,
+      apiKeyValid: isActive,
+      plan: plan,
+      requestsLeft: requestsLeft,
+      message: isActive ? 'API key is active' : 'API key is expired or invalid'
+    });
+  } catch (error) {
+    console.error('API Status Check Error:', error.response?.data || error.message);
+    res.json({
+      success: false,
+      apiKeyValid: false,
+      error: error.response?.data?.errors?.token || error.message,
+      message: 'API key is invalid or expired'
+    });
+  }
+});
+
 // Proxy for football API upcoming matches
 app.get('/api/football/fixtures/upcoming', authenticateToken, async (req, res) => {
   try {
     const { league } = req.query;
-    const FOOTBALL_API_KEY = '06fd9ad610ba7c51d947ecab06d4f87';
     
-    let url = 'https://v3.football.api-sports.io/fixtures';
+    let url = `${FOOTBALL_API_URL}/fixtures`;
     const params = new URLSearchParams({
       next: '50',
       timezone: 'Africa/Nairobi',
@@ -4781,38 +4874,78 @@ app.get('/api/football/fixtures/upcoming', authenticateToken, async (req, res) =
       params.append('league', league);
     }
     
+    console.log(`📡 Fetching upcoming matches with params:`, params.toString());
+    
     const response = await axios.get(`${url}?${params.toString()}`, {
       headers: {
         'x-apisports-key': FOOTBALL_API_KEY,
         'x-apisports-host': 'v3.football.api-sports.io'
       },
-      timeout: 10000
+      timeout: 15000
     });
+    
+    console.log(`✅ Upcoming matches fetched: ${response.data.results || 0}`);
+    
+    // Check if there's an API error
+    if (response.data.errors && Object.keys(response.data.errors).length > 0) {
+      console.error('API Error:', response.data.errors);
+      return res.status(400).json({
+        success: false,
+        error: response.data.errors,
+        response: []
+      });
+    }
     
     res.json(response.data);
   } catch (error) {
-    console.error('❌ Football API upcoming matches error:', error.message);
-    res.status(500).json({ response: [], error: error.message });
+    console.error('❌ Football API upcoming matches error:', error.response?.data || error.message);
+    
+    // Provide detailed error response
+    const errorMessage = error.response?.data?.errors?.token || error.message;
+    res.status(500).json({ 
+      success: false,
+      error: errorMessage,
+      response: [],
+      message: 'Unable to fetch matches. Please check API key or try again later.'
+    });
   }
 });
 
 // Proxy for football API live matches
 app.get('/api/football/fixtures/live', authenticateToken, async (req, res) => {
   try {
-    const FOOTBALL_API_KEY = '06fd9ad610ba7c51d947ecab06d4f87';
+    console.log('📡 Fetching live matches...');
     
-    const response = await axios.get('https://v3.football.api-sports.io/fixtures?live=all', {
+    const response = await axios.get(`${FOOTBALL_API_URL}/fixtures?live=all`, {
       headers: {
         'x-apisports-key': FOOTBALL_API_KEY,
         'x-apisports-host': 'v3.football.api-sports.io'
       },
-      timeout: 10000
+      timeout: 15000
     });
+    
+    console.log(`✅ Live matches fetched: ${response.data.results || 0}`);
+    
+    if (response.data.errors && Object.keys(response.data.errors).length > 0) {
+      console.error('API Error:', response.data.errors);
+      return res.status(400).json({
+        success: false,
+        error: response.data.errors,
+        response: []
+      });
+    }
     
     res.json(response.data);
   } catch (error) {
-    console.error('❌ Football API live matches error:', error.message);
-    res.status(500).json({ response: [], error: error.message });
+    console.error('❌ Football API live matches error:', error.response?.data || error.message);
+    
+    const errorMessage = error.response?.data?.errors?.token || error.message;
+    res.status(500).json({ 
+      success: false,
+      error: errorMessage,
+      response: [],
+      message: 'Unable to fetch live matches. Please try again later.'
+    });
   }
 });
 
@@ -4820,9 +4953,10 @@ app.get('/api/football/fixtures/live', authenticateToken, async (req, res) => {
 app.get('/api/football/odds/:fixtureId', authenticateToken, async (req, res) => {
   try {
     const { fixtureId } = req.params;
-    const FOOTBALL_API_KEY = '06fd9ad610ba7c51d947ecab06d4f87';
     
-    const response = await axios.get(`https://v3.football.api-sports.io/odds?fixture=${fixtureId}&bookmaker=bet365`, {
+    console.log(`📡 Fetching odds for fixture: ${fixtureId}`);
+    
+    const response = await axios.get(`${FOOTBALL_API_URL}/odds?fixture=${fixtureId}&bookmaker=8`, {
       headers: {
         'x-apisports-key': FOOTBALL_API_KEY,
         'x-apisports-host': 'v3.football.api-sports.io'
@@ -4830,10 +4964,126 @@ app.get('/api/football/odds/:fixtureId', authenticateToken, async (req, res) => 
       timeout: 10000
     });
     
+    if (response.data.errors && Object.keys(response.data.errors).length > 0) {
+      console.error('API Error:', response.data.errors);
+      return res.status(400).json({
+        success: false,
+        error: response.data.errors,
+        odds: null
+      });
+    }
+    
     res.json(response.data);
   } catch (error) {
     console.error('❌ Football API odds error:', error.message);
-    res.status(500).json({ response: null, error: error.message });
+    res.status(500).json({ 
+      success: false,
+      error: error.message,
+      odds: null 
+    });
+  }
+});
+
+// Get popular leagues
+app.get('/api/football/leagues/popular', authenticateToken, async (req, res) => {
+  try {
+    const popularLeagueIds = [39, 140, 78, 135, 61, 2]; // Premier League, La Liga, Bundesliga, Serie A, Ligue 1, UCL
+    
+    const response = await axios.get(`${FOOTBALL_API_URL}/leagues`, {
+      headers: {
+        'x-apisports-key': FOOTBALL_API_KEY,
+        'x-apisports-host': 'v3.football.api-sports.io'
+      },
+      timeout: 10000
+    });
+    
+    const leagues = response.data.response || [];
+    const popularLeagues = leagues.filter(league => 
+      popularLeagueIds.includes(league.league.id)
+    ).map(league => ({
+      id: league.league.id,
+      name: league.league.name,
+      country: league.country.name,
+      logo: league.league.logo,
+      type: league.league.type
+    }));
+    
+    res.json(popularLeagues);
+  } catch (error) {
+    console.error('❌ Error fetching popular leagues:', error.message);
+    res.status(500).json({ error: error.message, leagues: [] });
+  }
+});
+
+// Get fixtures by league
+app.get('/api/football/fixtures/league/:leagueId', authenticateToken, async (req, res) => {
+  const { leagueId } = req.params;
+  const { season = '2024' } = req.query;
+  
+  try {
+    console.log(`📡 Fetching fixtures for league: ${leagueId}, season: ${season}`);
+    
+    const response = await axios.get(`${FOOTBALL_API_URL}/fixtures?league=${leagueId}&season=${season}`, {
+      headers: {
+        'x-apisports-key': FOOTBALL_API_KEY,
+        'x-apisports-host': 'v3.football.api-sports.io'
+      },
+      timeout: 10000
+    });
+    
+    if (response.data.errors && Object.keys(response.data.errors).length > 0) {
+      console.error('API Error:', response.data.errors);
+      return res.status(400).json({
+        success: false,
+        error: response.data.errors,
+        response: []
+      });
+    }
+    
+    res.json(response.data);
+  } catch (error) {
+    console.error('❌ Football API league fixtures error:', error.message);
+    res.status(500).json({ 
+      success: false,
+      error: error.message, 
+      response: [] 
+    });
+  }
+});
+
+// Get team statistics
+app.get('/api/football/team/:teamId', authenticateToken, async (req, res) => {
+  const { teamId } = req.params;
+  const { season = '2024' } = req.query;
+  
+  try {
+    console.log(`📡 Fetching team stats for team: ${teamId}, season: ${season}`);
+    
+    const response = await axios.get(`${FOOTBALL_API_URL}/teams/statistics?team=${teamId}&season=${season}`, {
+      headers: {
+        'x-apisports-key': FOOTBALL_API_KEY,
+        'x-apisports-host': 'v3.football.api-sports.io'
+      },
+      timeout: 10000
+    });
+    
+    if (response.data.errors && Object.keys(response.data.errors).length > 0) {
+      console.error('API Error:', response.data.errors);
+      return res.status(400).json({
+        success: false,
+        error: response.data.errors,
+        statistics: null
+      });
+    }
+    
+    res.json(response.data);
+  } catch (error) {
+    console.error('❌ Football API team statistics error:', error.message);
+    res.status(500).json({ 
+      success: false,
+      error: error.message,
+      statistics: null 
+    });
   }
 });
 
