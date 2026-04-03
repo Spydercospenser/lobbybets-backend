@@ -33,7 +33,8 @@ const allowedOrigins = [
   'exp://localhost:19001',
   'exp://localhost:19002',
   'http://localhost:5000',
-  'http://localhost:5001'
+  'http://localhost:5001',
+  'https://lobbybets-backend.onrender.com'
 ];
 
 const allowedOriginPatterns = [
@@ -63,7 +64,7 @@ const corsOptions = {
     callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Cache-Control', 'Pragma', 'Expires'],  // <-- ADDED Cache-Control
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Cache-Control', 'Pragma', 'Expires'],
   exposedHeaders: ['Content-Range', 'X-Content-Range'],
   credentials: true,
   optionsSuccessStatus: 200,
@@ -92,6 +93,10 @@ const pool = new Pool({
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
 });
+
+// ==================== CONSTANTS ====================
+const COMMISSION_RATE = 0.15; // 15% commission
+const MIN_WITHDRAWAL = 500; // Minimum KES 500 to withdraw commission
 
 // ==================== INITIALIZE ALL TABLES ====================
 async function initializeAllTables() {
@@ -183,6 +188,27 @@ async function initializeAllTables() {
         cancellation_reason TEXT,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Game stats table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS game_stats (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES profiles(id) ON DELETE CASCADE,
+        game_type VARCHAR(50) NOT NULL,
+        total_bets INTEGER DEFAULT 0,
+        total_wins INTEGER DEFAULT 0,
+        total_losses INTEGER DEFAULT 0,
+        total_wagered DECIMAL(12,2) DEFAULT 0,
+        total_won DECIMAL(12,2) DEFAULT 0,
+        total_profit DECIMAL(12,2) DEFAULT 0,
+        biggest_win DECIMAL(12,2) DEFAULT 0,
+        biggest_multiplier DECIMAL(10,2) DEFAULT 0,
+        last_played TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(user_id, game_type)
       )
     `);
 
@@ -472,6 +498,34 @@ async function initializeAllTables() {
       )
     `);
 
+    // ==================== AFFILIATE TABLES ====================
+    
+    // Commission earnings table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS commission_earnings (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES profiles(id) ON DELETE CASCADE,
+        from_user_id INTEGER REFERENCES profiles(id) ON DELETE CASCADE,
+        deposit_amount DECIMAL(12,2) NOT NULL,
+        commission_amount DECIMAL(12,2) NOT NULL,
+        deposit_id INTEGER REFERENCES transactions(id),
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Commission withdrawals table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS commission_withdrawals (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES profiles(id) ON DELETE CASCADE,
+        amount DECIMAL(12,2) NOT NULL,
+        reference VARCHAR(100) UNIQUE,
+        status VARCHAR(20) DEFAULT 'pending',
+        processed_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
     console.log('✅ All tables initialized successfully');
   } catch (error) {
     console.error('❌ Error initializing tables:', error);
@@ -527,7 +581,7 @@ async function initializeFunctions() {
         UPDATE wallets 
         SET 
           main_balance = (
-            SELECT COALESCE(SUM(CASE WHEN type IN ('deposit', 'win', 'bonus') THEN amount ELSE 0 END), 0) -
+            SELECT COALESCE(SUM(CASE WHEN type IN ('deposit', 'win', 'bonus', 'commission') THEN amount ELSE 0 END), 0) -
                    COALESCE(SUM(CASE WHEN type IN ('withdrawal', 'bet') THEN amount ELSE 0 END), 0)
             FROM transactions 
             WHERE user_id = NEW.user_id AND status = 'completed'
@@ -624,9 +678,140 @@ async function initializeFunctions() {
         EXECUTE FUNCTION handle_mpesa_completion();
     `);
 
+    // ==================== AFFILIATE COMMISSION TRIGGER ====================
+    
+    // Function to credit affiliate commission on deposit
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION credit_affiliate_commission()
+      RETURNS TRIGGER AS $$
+      DECLARE
+        referrer_id INTEGER;
+        commission_amount DECIMAL;
+        current_balance DECIMAL;
+      BEGIN
+        -- Only process completed deposits
+        IF NEW.status = 'completed' AND (OLD.status IS NULL OR OLD.status != 'completed') THEN
+          -- Get the referrer for this user
+          SELECT referred_by INTO referrer_id
+          FROM profiles
+          WHERE id = NEW.user_id;
+          
+          -- If user has a referrer
+          IF referrer_id IS NOT NULL THEN
+            -- Calculate 15% commission
+            commission_amount := NEW.amount * ${COMMISSION_RATE};
+            
+            -- Get current affiliate balance
+            SELECT COALESCE(affiliate_balance, 0) INTO current_balance
+            FROM wallets WHERE user_id = referrer_id;
+            
+            -- Add commission to referrer's affiliate balance
+            UPDATE wallets 
+            SET affiliate_balance = affiliate_balance + commission_amount,
+                updated_at = NOW()
+            WHERE user_id = referrer_id;
+            
+            -- Record commission transaction
+            INSERT INTO transactions (
+              user_id, type, amount, status, description, reference,
+              balance_before, balance_after, profit, created_at
+            )
+            SELECT 
+              referrer_id,
+              'commission',
+              commission_amount,
+              'completed',
+              'Affiliate commission from deposit by user ' || NEW.user_id,
+              'COMM-' || NEW.id,
+              current_balance,
+              current_balance + commission_amount,
+              commission_amount,
+              NOW();
+            
+            -- Insert into commission tracking table
+            INSERT INTO commission_earnings (
+              user_id, from_user_id, deposit_amount, commission_amount, deposit_id, created_at
+            ) VALUES (
+              referrer_id, NEW.user_id, NEW.amount, commission_amount, NEW.id, NOW()
+            );
+            
+            RAISE NOTICE 'Commission credited: % to user % from deposit %', commission_amount, referrer_id, NEW.id;
+          END IF;
+        END IF;
+        
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    // Create trigger for affiliate commission
+    await pool.query(`
+      DROP TRIGGER IF EXISTS trigger_affiliate_commission ON transactions;
+      CREATE TRIGGER trigger_affiliate_commission
+        AFTER UPDATE OF status ON transactions
+        FOR EACH ROW
+        WHEN (NEW.type = 'deposit' AND NEW.status = 'completed')
+        EXECUTE FUNCTION credit_affiliate_commission();
+    `);
+
     console.log('✅ Functions and triggers initialized');
   } catch (error) {
     console.error('❌ Error initializing functions:', error);
+  }
+}
+
+// ==================== GAME STATS TRIGGER ====================
+async function initializeGameStatsTrigger() {
+  try {
+    console.log('🔄 Initializing game stats trigger...');
+
+    // Function to update game_stats
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION update_game_stats()
+      RETURNS TRIGGER AS $$
+      BEGIN
+        -- Insert or update basic stats on bet creation
+        INSERT INTO game_stats (user_id, game_type, total_bets, total_wagered, last_played)
+        VALUES (NEW.user_id, NEW.game_type, 1, NEW.stake, NOW())
+        ON CONFLICT (user_id, game_type) DO UPDATE
+        SET total_bets = game_stats.total_bets + 1,
+            total_wagered = game_stats.total_wagered + NEW.stake,
+            last_played = NOW(),
+            updated_at = NOW();
+        
+        -- Update win/loss stats when bet is settled
+        IF NEW.status IN ('cashed_out', 'won') THEN
+          UPDATE game_stats 
+          SET total_wins = total_wins + 1,
+              total_won = total_won + COALESCE(NEW.actual_winnings, 0),
+              total_profit = total_profit + COALESCE(NEW.profit, 0),
+              biggest_win = GREATEST(biggest_win, COALESCE(NEW.actual_winnings, 0)),
+              biggest_multiplier = GREATEST(biggest_multiplier, COALESCE(NEW.cashout_multiplier, 0))
+          WHERE user_id = NEW.user_id AND game_type = NEW.game_type;
+        ELSIF NEW.status = 'lost' THEN
+          UPDATE game_stats 
+          SET total_losses = total_losses + 1,
+              total_profit = total_profit + COALESCE(NEW.profit, 0)
+          WHERE user_id = NEW.user_id AND game_type = NEW.game_type;
+        END IF;
+        
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    // Create trigger for game_stats
+    await pool.query(`
+      DROP TRIGGER IF EXISTS trigger_update_game_stats ON bets;
+      CREATE TRIGGER trigger_update_game_stats
+        AFTER INSERT OR UPDATE OF status ON bets
+        FOR EACH ROW
+        EXECUTE FUNCTION update_game_stats();
+    `);
+
+    console.log('✅ Game stats trigger initialized');
+  } catch (error) {
+    console.error('❌ Error initializing game stats trigger:', error);
   }
 }
 
@@ -639,6 +824,7 @@ pool.connect(async (err, client, release) => {
     release();
     await initializeAllTables();
     await initializeFunctions();
+    await initializeGameStatsTrigger();
   }
 });
 
@@ -890,20 +1076,6 @@ async function handleFailedLogin(email) {
   }
 }
 
-async function isAdminLocked(adminId) {
-  try {
-    const result = await pool.query(
-      'SELECT locked_until FROM admins WHERE id = $1',
-      [adminId]
-    );
-    if (result.rows.length === 0) return false;
-    return result.rows[0].locked_until && new Date(result.rows[0].locked_until) > new Date();
-  } catch (error) {
-    console.error('Error checking admin lock:', error);
-    return false;
-  }
-}
-
 async function resetFailedLogin(adminId) {
   try {
     await pool.query(
@@ -979,14 +1151,15 @@ app.get('/api/test-jwt', (req, res) => {
   }
 });
 
-// ==================== USER REGISTRATION ====================
+// ==================== USER REGISTRATION (UPDATED WITH REFERRAL) ====================
 app.post('/api/register', async (req, res) => {
-  const { name, email, phone, password, age } = req.body;
+  const { name, email, phone, password, age, referral_code } = req.body;
   
   let client;
   
   try {
     console.log('📝 Registration attempt for:', email);
+    if (referral_code) console.log('🔗 Referral code provided:', referral_code);
     
     if (!name || !email || !phone || !password || !age) {
       return res.status(400).json({ 
@@ -1030,29 +1203,43 @@ app.post('/api/register', async (req, res) => {
     
     const hashedPassword = await bcrypt.hash(password, 10);
     
-    let referralCode;
+    // Handle referral code
+    let referredById = null;
+    if (referral_code) {
+      const referrerResult = await client.query(
+        'SELECT id FROM profiles WHERE referral_code = $1',
+        [referral_code.toUpperCase()]
+      );
+      if (referrerResult.rows.length > 0) {
+        referredById = referrerResult.rows[0].id;
+        console.log('🔗 User referred by ID:', referredById);
+      }
+    }
+    
+    // Generate unique referral code for the new user
+    let newReferralCode;
     let isUnique = false;
     
     while (!isUnique) {
-      referralCode = 'REF' + Math.random().toString(36).substring(2, 8).toUpperCase();
+      newReferralCode = 'REF' + Math.random().toString(36).substring(2, 8).toUpperCase();
       const check = await client.query(
         'SELECT id FROM profiles WHERE referral_code = $1',
-        [referralCode]
+        [newReferralCode]
       );
       if (check.rows.length === 0) isUnique = true;
     }
     
     const userResult = await client.query(
       `INSERT INTO profiles 
-       (phone, full_name, email, age, referral_code, password_hash, created_at, updated_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW()) 
+       (phone, full_name, email, age, referral_code, referred_by, password_hash, created_at, updated_at) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW()) 
        RETURNING id, phone, full_name, email, age, referral_code, created_at`,
-      [normalizedPhone, name, email, age, referralCode, hashedPassword]
+      [normalizedPhone, name, email, age, newReferralCode, referredById, hashedPassword]
     );
     
     const userId = userResult.rows[0].id;
     
-    // ✅ FIXED: Remove non-existent columns (bonus_balance, affiliate_balance)
+    // Create wallet with welcome bonus
     await client.query(
       `INSERT INTO wallets 
        (user_id, main_balance, lifetime_deposits, created_at, updated_at) 
@@ -1083,6 +1270,7 @@ app.post('/api/register', async (req, res) => {
     
     console.log('✅ User registered successfully:', userId);
     console.log('💰 Welcome bonus of 100 KES added to wallet');
+    if (referredById) console.log('🔗 Referral tracking complete');
     
     res.json({ 
       success: true, 
@@ -1110,6 +1298,7 @@ app.post('/api/register', async (req, res) => {
     if (client) client.release();
   }
 });
+
 // ==================== USER LOGIN ====================
 app.post('/api/login', async (req, res) => {
   const { phone, password } = req.body;
@@ -1340,6 +1529,7 @@ app.post('/api/profile/remove-image', authenticateToken, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 // ==================== GAME CASHOUT ====================
 app.post('/api/games/cashout', authenticateToken, async (req, res) => {
   const { betId, userId, multiplier } = req.body;
@@ -1353,13 +1543,11 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized' });
     }
     
-    // Handle string bet IDs (like "pending_xxx") by looking up the actual bet
     let numericBetId;
     
     if (typeof betId === 'string' && betId.includes('pending_')) {
       console.log('⚠️ Received pending bet ID, looking up actual bet...');
       
-      // Find the most recent pending bet for this user in the current game
       const betLookup = await pool.query(
         `SELECT id FROM bets 
          WHERE user_id = $1 AND status = 'pending' AND game_type IN ('aviator', 'jetx')
@@ -1384,7 +1572,6 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
     client = await pool.connect();
     await client.query('BEGIN');
     
-    // Get bet with lock
     const betResult = await client.query(
       `SELECT * FROM bets 
        WHERE id = $1 AND user_id = $2 AND game_type IN ('aviator', 'jetx') 
@@ -1404,12 +1591,10 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: `Bet already ${bet.status}` });
     }
     
-    // Calculate winnings
     const stake = parseFloat(bet.stake);
     const winnings = stake * multiplier;
     const profit = winnings - stake;
     
-    // Update bet
     await client.query(
       `UPDATE bets 
        SET status = 'cashed_out',
@@ -1421,7 +1606,6 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
       [multiplier, winnings, profit, numericBetId]
     );
     
-    // Update wallet - ADD WINNINGS
     await client.query(
       `UPDATE wallets 
        SET main_balance = main_balance + $1,
@@ -1432,7 +1616,6 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
       [winnings, profit, winnings, userId]
     );
     
-    // Get current balance
     const walletResult = await client.query(
       `SELECT main_balance FROM wallets WHERE user_id = $1`,
       [userId]
@@ -1440,7 +1623,6 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
     const currentBalance = parseFloat(walletResult.rows[0].main_balance);
     const balanceBefore = currentBalance - winnings;
     
-    // Record transaction
     await client.query(
       `INSERT INTO transactions (
         user_id, type, amount, status, description, reference, 
@@ -1482,6 +1664,7 @@ app.post('/api/games/cashout', authenticateToken, async (req, res) => {
     if (client) client.release();
   }
 });
+
 // ==================== WALLET ENDPOINTS ====================
 app.get('/api/wallet/:userId', authenticateToken, async (req, res) => {
   try {
@@ -1494,7 +1677,7 @@ app.get('/api/wallet/:userId', authenticateToken, async (req, res) => {
       `SELECT 
          w.*,
          (SELECT COALESCE(SUM(amount), 0) FROM transactions 
-          WHERE user_id = w.user_id AND type IN ('deposit', 'win', 'bonus') AND status = 'completed') as calculated_credits,
+          WHERE user_id = w.user_id AND type IN ('deposit', 'win', 'bonus', 'commission') AND status = 'completed') as calculated_credits,
          (SELECT COALESCE(SUM(amount), 0) FROM transactions 
           WHERE user_id = w.user_id AND type IN ('withdrawal', 'bet') AND status = 'completed') as calculated_debits
        FROM wallets w 
@@ -1545,7 +1728,7 @@ app.post('/api/wallet/sync', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `WITH balance_calc AS (
          SELECT 
-           COALESCE(SUM(CASE WHEN type IN ('deposit', 'win', 'bonus') THEN amount ELSE 0 END), 0) as credits,
+           COALESCE(SUM(CASE WHEN type IN ('deposit', 'win', 'bonus', 'commission') THEN amount ELSE 0 END), 0) as credits,
            COALESCE(SUM(CASE WHEN type IN ('withdrawal', 'bet') THEN amount ELSE 0 END), 0) as debits,
            COALESCE(SUM(profit), 0) as total_profit
          FROM transactions 
@@ -1707,6 +1890,7 @@ app.post('/api/wallet/update', authenticateToken, async (req, res) => {
     if (client) client.release();
   }
 });
+
 // ==================== GAME STATS ENDPOINT ====================
 app.get('/api/user/game-stats/:userId', authenticateToken, async (req, res) => {
   try {
@@ -1715,7 +1899,6 @@ app.get('/api/user/game-stats/:userId', authenticateToken, async (req, res) => {
       [req.params.userId]
     );
     
-    // Format stats by game type
     const stats = {
       aviator: { ...defaultGameStats },
       jetx: { ...defaultGameStats },
@@ -1747,6 +1930,7 @@ app.get('/api/user/game-stats/:userId', authenticateToken, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 // ==================== USER PROFITS ====================
 app.get('/api/user/profits/:userId', authenticateToken, async (req, res) => {
   try {
@@ -2823,22 +3007,18 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
   try {
     console.log('🎲 Placing game bet:', { userId, gameType, stake });
     
-    // Validate user authorization
     if (req.user.userId !== userId) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
     
-    // Validate stake
     if (stake < 10 || stake > 5000) {
       return res.status(400).json({ error: 'Stake must be between KES 10 and 5,000' });
     }
     
-    // Validate game type
     if (!['aviator', 'jetx'].includes(gameType)) {
       return res.status(400).json({ error: 'Invalid game type' });
     }
     
-    // Convert to proper types
     const numericUserId = parseInt(userId);
     const numericStake = parseFloat(stake);
     const numericAutoCashout = autoCashout ? parseFloat(autoCashout) : null;
@@ -2850,7 +3030,6 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     client = await pool.connect();
     await client.query('BEGIN');
     
-    // Check wallet balance
     const wallet = await client.query(
       'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
       [numericUserId]
@@ -2872,7 +3051,6 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
       });
     }
     
-    // Look for waiting OR flying rounds
     let roundResult = await client.query(
       `SELECT * FROM game_rounds 
        WHERE game = $1 AND status IN ('waiting', 'flying')
@@ -2885,16 +3063,13 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     let roundNumber;
     
     if (roundResult.rows.length === 0) {
-      // Get the maximum round number for this game
       const maxRoundResult = await client.query(
         `SELECT COALESCE(MAX(round_number), 0) as max_round FROM game_rounds WHERE game = $1`,
         [gameType]
       );
       
-      // Calculate next round number
       const nextRoundNumber = (parseInt(maxRoundResult.rows[0].max_round) || 0) + 1;
       
-      // CORRECTED: Use INTEGER ID (SERIAL auto-increment) - NOT UUID
       const newRound = await client.query(
         `INSERT INTO game_rounds (game, round_number, status, started_at)
          VALUES ($1, $2, $3, NOW())
@@ -2902,19 +3077,17 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
         [gameType, nextRoundNumber, 'waiting']
       );
       
-      roundId = newRound.rows[0].id;  // This is INTEGER
+      roundId = newRound.rows[0].id;
       roundNumber = newRound.rows[0].round_number;
       console.log(`🆕 Created new round #${roundNumber} with ID: ${roundId}`);
     } else {
-      roundId = roundResult.rows[0].id;  // This is INTEGER
+      roundId = roundResult.rows[0].id;
       roundNumber = roundResult.rows[0].round_number;
       console.log(`🔄 Using existing round #${roundNumber} with ID: ${roundId}`);
     }
     
-    // Generate unique reference number
     const referenceNumber = `${gameType}-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
     
-    // CORRECTED: Insert bet with INTEGER round_id
     const betResult = await client.query(
       `INSERT INTO bets (
         user_id, selections, stake, total_odds, potential_winnings,
@@ -2930,7 +3103,7 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
         'pending',
         'single',
         gameType,
-        roundId,  // INTEGER
+        roundId,
         referenceNumber,
         -numericStake
       ]
@@ -2938,7 +3111,6 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     
     const betId = betResult.rows[0].id;
     
-    // Update wallet - deduct stake
     await client.query(
       `UPDATE wallets 
        SET main_balance = main_balance - $1,
@@ -2949,7 +3121,6 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
       [numericStake, numericUserId]
     );
     
-    // Update game round stats
     await client.query(
       `UPDATE game_rounds 
        SET total_bets = total_bets + 1,
@@ -2958,7 +3129,6 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
       [numericStake, roundId]
     );
     
-    // Record transaction
     await client.query(
       `INSERT INTO transactions (
         user_id, type, amount, status, description, reference, 
@@ -2979,7 +3149,6 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     
     await client.query('COMMIT');
     
-    // Get updated wallet balance
     const updatedWallet = await pool.query(
       'SELECT main_balance, total_profit FROM wallets WHERE user_id = $1',
       [numericUserId]
@@ -3014,6 +3183,7 @@ app.post('/api/games/bet', authenticateToken, async (req, res) => {
     if (client) client.release();
   }
 });
+
 // ==================== JACKPOT ====================
 app.post('/api/jackpot/enter', authenticateToken, async (req, res) => {
   const { userId, jackpotId, numbers } = req.body;
@@ -3482,6 +3652,401 @@ app.get('/api/stats/:userId', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('❌ Stats error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== AFFILIATE/REFERRAL SYSTEM ====================
+
+// Get referral statistics for user
+app.get('/api/affiliate/stats/:userId', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    if (req.user.userId !== parseInt(userId)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    const userResult = await pool.query(
+      'SELECT referral_code FROM profiles WHERE id = $1',
+      [userId]
+    );
+    
+    const referralCode = userResult.rows[0]?.referral_code || null;
+    
+    const referralsResult = await pool.query(
+      `SELECT p.id, p.full_name, p.phone, p.created_at,
+              COALESCE((
+                SELECT SUM(amount) FROM transactions 
+                WHERE user_id = p.id AND type = 'deposit' AND status = 'completed'
+              ), 0) as total_deposits,
+              COALESCE((
+                SELECT SUM(amount * $2) FROM transactions 
+                WHERE user_id = p.id AND type = 'deposit' AND status = 'completed'
+              ), 0) as earned_commission
+       FROM profiles p
+       WHERE p.referred_by = $1
+       ORDER BY p.created_at DESC`,
+      [userId, COMMISSION_RATE]
+    );
+    
+    const referrals = referralsResult.rows;
+    
+    let totalCommission = 0;
+    let pendingCommission = 0;
+    let activeReferrals = 0;
+    
+    for (const ref of referrals) {
+      const commission = parseFloat(ref.earned_commission) || 0;
+      totalCommission += commission;
+      
+      if (parseFloat(ref.total_deposits) >= 100) {
+        pendingCommission += commission;
+        activeReferrals++;
+      }
+    }
+    
+    const stats = {
+      referral_code: referralCode,
+      total_commission_earned: totalCommission,
+      pending_commission: pendingCommission,
+      paid_commission: 0,
+      total_referrals: referrals.length,
+      active_referrals: activeReferrals,
+      pending_referrals: referrals.length - activeReferrals
+    };
+    
+    res.json(stats);
+    
+  } catch (error) {
+    console.error('❌ Error fetching referral stats:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get list of referrals for user
+app.get('/api/affiliate/referrals/:userId', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    if (req.user.userId !== parseInt(userId)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    const result = await pool.query(
+      `SELECT p.id, p.full_name as name, p.phone, p.created_at as date,
+              COALESCE((
+                SELECT SUM(amount) FROM transactions 
+                WHERE user_id = p.id AND type = 'deposit' AND status = 'completed'
+              ), 0) as deposits,
+              COALESCE((
+                SELECT SUM(amount * $2) FROM transactions 
+                WHERE user_id = p.id AND type = 'deposit' AND status = 'completed'
+              ), 0) as commission,
+              CASE 
+                WHEN COALESCE((
+                  SELECT SUM(amount) FROM transactions 
+                  WHERE user_id = p.id AND type = 'deposit' AND status = 'completed'
+                ), 0) >= 100 THEN 'active'
+                ELSE 'pending'
+              END as status
+       FROM profiles p
+       WHERE p.referred_by = $1
+       ORDER BY p.created_at DESC`,
+      [userId, COMMISSION_RATE]
+    );
+    
+    res.json(result.rows);
+    
+  } catch (error) {
+    console.error('❌ Error fetching referrals:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Withdraw commission from affiliate balance
+app.post('/api/affiliate/withdraw', authenticateToken, async (req, res) => {
+  const { userId, amount } = req.body;
+  
+  let client;
+  
+  try {
+    if (req.user.userId !== parseInt(userId)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    if (amount < MIN_WITHDRAWAL) {
+      return res.status(400).json({ 
+        success: false, 
+        error: `Minimum withdrawal is KES ${MIN_WITHDRAWAL}` 
+      });
+    }
+    
+    client = await pool.connect();
+    await client.query('BEGIN');
+    
+    const commissionResult = await client.query(
+      `SELECT COALESCE(SUM(t.amount * $2), 0) as total_commission,
+              COALESCE(SUM(CASE 
+                WHEN t.amount >= 100 THEN t.amount * $2 
+                ELSE 0 
+              END), 0) as available_commission
+       FROM transactions t
+       JOIN profiles p ON t.user_id = p.id
+       WHERE p.referred_by = $1 
+         AND t.type = 'deposit' 
+         AND t.status = 'completed'`,
+      [userId, COMMISSION_RATE]
+    );
+    
+    const availableCommission = parseFloat(commissionResult.rows[0].available_commission);
+    
+    if (availableCommission < amount) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ 
+        success: false, 
+        error: `Insufficient commission. Available: KES ${availableCommission}` 
+      });
+    }
+    
+    const walletResult = await client.query(
+      'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
+      [userId]
+    );
+    
+    let currentBalance = 0;
+    if (walletResult.rows.length === 0) {
+      const newWallet = await client.query(
+        `INSERT INTO wallets (user_id, main_balance, created_at, updated_at)
+         VALUES ($1, 0, NOW(), NOW())
+         RETURNING *`,
+        [userId]
+      );
+      currentBalance = parseFloat(newWallet.rows[0].main_balance);
+    } else {
+      currentBalance = parseFloat(walletResult.rows[0].main_balance);
+    }
+    
+    await client.query(
+      `UPDATE wallets 
+       SET main_balance = main_balance + $1,
+           affiliate_balance = affiliate_balance - $1,
+           updated_at = NOW()
+       WHERE user_id = $2`,
+      [amount, userId]
+    );
+    
+    const reference = `COMM-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+    
+    await client.query(
+      `INSERT INTO transactions (
+        user_id, type, amount, status, description, reference,
+        balance_before, balance_after, profit, created_at
+      ) VALUES ($1, 'commission_withdrawal', $2, 'completed', $3, $4, $5, $5 + $2, 0, NOW())`,
+      [userId, amount, `Affiliate commission withdrawal`, reference, currentBalance]
+    );
+    
+    await client.query(
+      `INSERT INTO commission_withdrawals (
+        user_id, amount, reference, status, created_at
+      ) VALUES ($1, $2, $3, 'completed', NOW())`,
+      [userId, amount, reference]
+    );
+    
+    await client.query('COMMIT');
+    
+    console.log(`✅ Commission withdrawal: User ${userId} withdrew KES ${amount}`);
+    
+    res.json({
+      success: true,
+      message: `Successfully withdrew KES ${amount}`,
+      amount: amount,
+      newBalance: currentBalance + amount,
+      reference
+    });
+    
+  } catch (error) {
+    if (client) await client.query('ROLLBACK');
+    console.error('❌ Commission withdrawal error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// Get commission withdrawal history
+app.get('/api/affiliate/commissions/:userId', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    if (req.user.userId !== parseInt(userId)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    const result = await pool.query(
+      `SELECT cw.*, 
+              COALESCE((
+                SELECT SUM(t.amount * $2) FROM transactions t
+                JOIN profiles p ON t.user_id = p.id
+                WHERE p.referred_by = $1 AND t.type = 'deposit' AND t.status = 'completed'
+                AND t.created_at <= cw.created_at
+              ), 0) as balance_after
+       FROM commission_withdrawals cw
+       WHERE cw.user_id = $1
+       ORDER BY cw.created_at DESC`,
+      [userId, COMMISSION_RATE]
+    );
+    
+    res.json(result.rows);
+    
+  } catch (error) {
+    console.error('❌ Error fetching commission history:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Generate referral code for user
+app.post('/api/affiliate/generate-code', authenticateToken, async (req, res) => {
+  const { userId } = req.body;
+  
+  try {
+    if (req.user.userId !== parseInt(userId)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    const existing = await pool.query(
+      'SELECT referral_code FROM profiles WHERE id = $1',
+      [userId]
+    );
+    
+    if (existing.rows[0]?.referral_code) {
+      return res.json({ 
+        success: true, 
+        referral_code: existing.rows[0].referral_code 
+      });
+    }
+    
+    let referralCode;
+    let isUnique = false;
+    
+    while (!isUnique) {
+      const prefix = 'REF';
+      const random = Math.random().toString(36).substring(2, 8).toUpperCase();
+      referralCode = `${prefix}${random}`;
+      
+      const check = await pool.query(
+        'SELECT id FROM profiles WHERE referral_code = $1',
+        [referralCode]
+      );
+      
+      if (check.rows.length === 0) {
+        isUnique = true;
+      }
+    }
+    
+    await pool.query(
+      'UPDATE profiles SET referral_code = $1 WHERE id = $2',
+      [referralCode, userId]
+    );
+    
+    res.json({
+      success: true,
+      referral_code: referralCode
+    });
+    
+  } catch (error) {
+    console.error('❌ Error generating referral code:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Validate referral code (for registration)
+app.get('/api/affiliate/validate/:code', async (req, res) => {
+  const { code } = req.params;
+  
+  try {
+    const result = await pool.query(
+      'SELECT id, full_name FROM profiles WHERE referral_code = $1',
+      [code.toUpperCase()]
+    );
+    
+    if (result.rows.length > 0) {
+      res.json({ 
+        valid: true, 
+        referrerId: result.rows[0].id,
+        referrerName: result.rows[0].full_name
+      });
+    } else {
+      res.json({ valid: false });
+    }
+    
+  } catch (error) {
+    console.error('❌ Error validating referral code:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get top referrers leaderboard
+app.get('/api/affiliate/leaderboard', async (req, res) => {
+  const { limit = 10 } = req.query;
+  
+  try {
+    const result = await pool.query(
+      `SELECT p.id, p.full_name, p.referral_code,
+              COUNT(r.id) as total_referrals,
+              COALESCE(SUM(CASE 
+                WHEN t.amount >= 100 THEN t.amount * $2 
+                ELSE 0 
+              END), 0) as total_commission,
+              COALESCE(SUM(t.amount), 0) as total_deposits_from_referrals
+       FROM profiles p
+       LEFT JOIN profiles r ON r.referred_by = p.id
+       LEFT JOIN transactions t ON t.user_id = r.id AND t.type = 'deposit' AND t.status = 'completed'
+       WHERE p.referral_code IS NOT NULL
+       GROUP BY p.id
+       ORDER BY total_commission DESC
+       LIMIT $1`,
+      [limit, COMMISSION_RATE]
+    );
+    
+    res.json(result.rows);
+    
+  } catch (error) {
+    console.error('❌ Error fetching leaderboard:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Track a new referral (when user signs up with code)
+app.post('/api/affiliate/track', authenticateToken, async (req, res) => {
+  const { referrer_code, referred_user_id } = req.body;
+  
+  try {
+    const referrerResult = await pool.query(
+      'SELECT id FROM profiles WHERE referral_code = $1',
+      [referrer_code.toUpperCase()]
+    );
+    
+    if (referrerResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Invalid referral code' });
+    }
+    
+    const referrerId = referrerResult.rows[0].id;
+    
+    await pool.query(
+      'UPDATE profiles SET referred_by = $1 WHERE id = $2',
+      [referrerId, referred_user_id]
+    );
+    
+    console.log(`✅ Referral tracked: User ${referred_user_id} referred by ${referrerId}`);
+    
+    res.json({ success: true });
+    
+  } catch (error) {
+    console.error('❌ Error tracking referral:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -4202,6 +4767,597 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
   }
 });
 
+// ==================== FOOTBALL API PROXY ENDPOINTS ====================
+
+// Proxy for football API upcoming matches
+app.get('/api/football/fixtures/upcoming', authenticateToken, async (req, res) => {
+  try {
+    const { league } = req.query;
+    const FOOTBALL_API_KEY = '06fd9ad610ba7c51d947ecab06d4f87';
+    
+    let url = 'https://v3.football.api-sports.io/fixtures';
+    const params = new URLSearchParams({
+      next: '50',
+      timezone: 'Africa/Nairobi',
+      status: 'NS'
+    });
+    
+    if (league) {
+      params.append('league', league);
+    }
+    
+    const response = await axios.get(`${url}?${params.toString()}`, {
+      headers: {
+        'x-apisports-key': FOOTBALL_API_KEY,
+        'x-apisports-host': 'v3.football.api-sports.io'
+      },
+      timeout: 10000
+    });
+    
+    res.json(response.data);
+  } catch (error) {
+    console.error('❌ Football API upcoming matches error:', error.message);
+    res.status(500).json({ response: [], error: error.message });
+  }
+});
+
+// Proxy for football API live matches
+app.get('/api/football/fixtures/live', authenticateToken, async (req, res) => {
+  try {
+    const FOOTBALL_API_KEY = '06fd9ad610ba7c51d947ecab06d4f87';
+    
+    const response = await axios.get('https://v3.football.api-sports.io/fixtures?live=all', {
+      headers: {
+        'x-apisports-key': FOOTBALL_API_KEY,
+        'x-apisports-host': 'v3.football.api-sports.io'
+      },
+      timeout: 10000
+    });
+    
+    res.json(response.data);
+  } catch (error) {
+    console.error('❌ Football API live matches error:', error.message);
+    res.status(500).json({ response: [], error: error.message });
+  }
+});
+
+// Proxy for football API odds
+app.get('/api/football/odds/:fixtureId', authenticateToken, async (req, res) => {
+  try {
+    const { fixtureId } = req.params;
+    const FOOTBALL_API_KEY = '06fd9ad610ba7c51d947ecab06d4f87';
+    
+    const response = await axios.get(`https://v3.football.api-sports.io/odds?fixture=${fixtureId}&bookmaker=bet365`, {
+      headers: {
+        'x-apisports-key': FOOTBALL_API_KEY,
+        'x-apisports-host': 'v3.football.api-sports.io'
+      },
+      timeout: 10000
+    });
+    
+    res.json(response.data);
+  } catch (error) {
+    console.error('❌ Football API odds error:', error.message);
+    res.status(500).json({ response: null, error: error.message });
+  }
+});
+
+// ==================== GAME ROUND MANAGEMENT ====================
+
+// Get current round for a game
+app.get('/api/games/current-round/:gameType', authenticateToken, async (req, res) => {
+  const { gameType } = req.params;
+  
+  try {
+    if (!['aviator', 'jetx'].includes(gameType)) {
+      return res.status(400).json({ error: 'Invalid game type' });
+    }
+    
+    const activeRound = await pool.query(
+      `SELECT gr.*, 
+              COUNT(b.id) as total_bets,
+              COALESCE(SUM(b.stake), 0) as total_wagered
+       FROM game_rounds gr
+       LEFT JOIN bets b ON gr.id = b.round_id AND b.game_type = $1
+       WHERE gr.game = $1 AND gr.status IN ('waiting', 'flying')
+       GROUP BY gr.id
+       ORDER BY gr.created_at DESC 
+       LIMIT 1`,
+      [gameType]
+    );
+    
+    if (activeRound.rows.length === 0) {
+      const lastRound = await pool.query(
+        `SELECT round_number FROM game_rounds 
+         WHERE game = $1 
+         ORDER BY round_number DESC 
+         LIMIT 1`,
+        [gameType]
+      );
+      
+      const nextRoundNumber = lastRound.rows.length > 0 ? lastRound.rows[0].round_number + 1 : 1;
+      
+      return res.json({
+        round: null,
+        status: 'waiting',
+        nextRoundNumber,
+        countdown: 8
+      });
+    }
+    
+    const round = activeRound.rows[0];
+    
+    res.json({
+      round: {
+        roundId: round.id,
+        roundNumber: round.round_number,
+        status: round.status,
+        crashPoint: round.crash_point,
+        currentMultiplier: round.status === 'flying' ? 1.0 : null,
+        startTime: round.started_at,
+        totalBets: parseInt(round.total_bets),
+        totalWagered: parseFloat(round.total_wagered)
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Get current round error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Start a new round
+app.post('/api/games/start-round/:gameType', authenticateToken, async (req, res) => {
+  const { gameType } = req.params;
+  const { userId } = req.body;
+  
+  try {
+    if (!['aviator', 'jetx'].includes(gameType)) {
+      return res.status(400).json({ error: 'Invalid game type' });
+    }
+    
+    const activeRound = await pool.query(
+      `SELECT id, status FROM game_rounds 
+       WHERE game = $1 AND status IN ('waiting', 'flying')`,
+      [gameType]
+    );
+    
+    if (activeRound.rows.length > 0) {
+      return res.status(400).json({ 
+        error: 'Round already in progress',
+        roundId: activeRound.rows[0].id,
+        status: activeRound.rows[0].status
+      });
+    }
+    
+    const lastRound = await pool.query(
+      `SELECT round_number FROM game_rounds 
+       WHERE game = $1 
+       ORDER BY round_number DESC 
+       LIMIT 1`,
+      [gameType]
+    );
+    
+    const nextRoundNumber = lastRound.rows.length > 0 ? lastRound.rows[0].round_number + 1 : 1;
+    
+    const crashPoint = generateCrashPoint();
+    
+    const newRound = await pool.query(
+      `INSERT INTO game_rounds 
+       (game, round_number, crash_point, status, started_at, created_at)
+       VALUES ($1, $2, $3, 'flying', NOW(), NOW())
+       RETURNING id, round_number, crash_point`,
+      [gameType, nextRoundNumber, crashPoint]
+    );
+    
+    console.log(`🎮 New ${gameType} round #${nextRoundNumber} started, crash point: ${crashPoint}x`);
+    
+    const crashDelay = Math.random() * 20000 + 10000;
+    setTimeout(async () => {
+      try {
+        await pool.query(
+          `UPDATE game_rounds 
+           SET status = 'crashed', ended_at = NOW()
+           WHERE id = $1 AND status = 'flying'`,
+          [newRound.rows[0].id]
+        );
+        console.log(`💥 ${gameType} round #${nextRoundNumber} auto-crashed at ${crashPoint}x`);
+      } catch (err) {
+        console.error('Auto-crash error:', err);
+      }
+    }, crashDelay);
+    
+    res.json({
+      success: true,
+      roundId: newRound.rows[0].id,
+      roundNumber: newRound.rows[0].round_number,
+      crashPoint: parseFloat(newRound.rows[0].crash_point),
+      status: 'flying'
+    });
+    
+  } catch (error) {
+    console.error('❌ Start round error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Helper function to generate crash point
+function generateCrashPoint() {
+  const random = Math.random() * 100;
+  
+  if (random < 50) {
+    return 1.00 + Math.random() * 1.00;
+  } else if (random < 70) {
+    return 2.00 + Math.random() * 0.99;
+  } else if (random < 85) {
+    return 3.00 + Math.random() * 2.00;
+  } else if (random < 91) {
+    return 5.00 + Math.random() * 3.00;
+  } else if (random < 94) {
+    return 8.00 + Math.random() * 5.00;
+  } else if (random < 96.5) {
+    return 13.00 + Math.random() * 6.00;
+  } else if (random < 98) {
+    return 19.00 + Math.random() * 10.00;
+  } else if (random < 99) {
+    return 29.00 + Math.random() * 20.00;
+  } else if (random < 99.5) {
+    return 49.00 + Math.random() * 26.00;
+  } else {
+    return 75.00 + Math.random() * 55.00;
+  }
+}
+
+// Get round details by ID
+app.get('/api/games/round/:roundId', authenticateToken, async (req, res) => {
+  const { roundId } = req.params;
+  
+  try {
+    const round = await pool.query(
+      `SELECT gr.*, 
+              COUNT(b.id) as total_bets,
+              COALESCE(SUM(b.stake), 0) as total_wagered,
+              COALESCE(SUM(CASE WHEN b.status = 'cashed_out' THEN b.actual_winnings ELSE 0 END), 0) as total_paid
+       FROM game_rounds gr
+       LEFT JOIN bets b ON gr.id = b.round_id
+       WHERE gr.id = $1
+       GROUP BY gr.id`,
+      [roundId]
+    );
+    
+    if (round.rows.length === 0) {
+      return res.status(404).json({ error: 'Round not found' });
+    }
+    
+    res.json({
+      roundId: round.rows[0].id,
+      roundNumber: round.rows[0].round_number,
+      gameType: round.rows[0].game,
+      status: round.rows[0].status,
+      crashPoint: parseFloat(round.rows[0].crash_point || 0),
+      currentMultiplier: round.rows[0].status === 'flying' ? 1.0 : null,
+      startTime: round.rows[0].started_at,
+      endTime: round.rows[0].ended_at,
+      stats: {
+        totalBets: parseInt(round.rows[0].total_bets),
+        totalWagered: parseFloat(round.rows[0].total_wagered),
+        totalPaid: parseFloat(round.rows[0].total_paid)
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Get round details error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Place a bet - FIXED endpoint to /api/bets/place
+app.post('/api/bets/place', authenticateToken, async (req, res) => {
+  const { userId, selections, stake, totalOdds, potentialWinnings, betType } = req.body;
+  
+  let client;
+  
+  try {
+    console.log('🎲 Bet placement:', { userId, stake, selections: selections?.length });
+    
+    if (stake < 10) {
+      return res.status(400).json({ error: 'Minimum stake is KES 10' });
+    }
+    
+    if (!selections || selections.length === 0) {
+      return res.status(400).json({ error: 'No selections provided' });
+    }
+    
+    client = await pool.connect();
+    await client.query('BEGIN');
+    
+    const walletResult = await client.query(
+      'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
+      [userId]
+    );
+    
+    if (walletResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Wallet not found' });
+    }
+    
+    const currentBalance = parseFloat(walletResult.rows[0].main_balance);
+    
+    if (currentBalance < stake) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ 
+        error: 'Insufficient balance',
+        available: currentBalance,
+        required: stake
+      });
+    }
+    
+    const referenceNumber = 'BET-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+    
+    const betResult = await client.query(
+      `INSERT INTO bets (
+        user_id, selections, stake, total_odds, potential_winnings, 
+        bet_type, reference_number, status, profit, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) RETURNING id`,
+      [
+        userId, 
+        JSON.stringify(selections), 
+        stake, 
+        totalOdds, 
+        potentialWinnings, 
+        betType || (selections.length > 1 ? 'accumulator' : 'single'),
+        referenceNumber,
+        'pending',
+        -stake
+      ]
+    );
+    
+    await client.query(
+      `UPDATE wallets 
+       SET main_balance = main_balance - $1,
+           lifetime_bets = lifetime_bets + $1,
+           total_profit = total_profit - $1,
+           updated_at = NOW()
+       WHERE user_id = $2`,
+      [stake, userId]
+    );
+    
+    await client.query(
+      `INSERT INTO transactions (
+        user_id, type, amount, status, description, reference, 
+        balance_before, balance_after, profit, created_at
+      ) VALUES ($1, 'bet', $2, 'completed', $3, $4, $5, $5 - $2, -$2, NOW())`,
+      [userId, stake, `Bet placed on ${selections.length} selection(s)`, referenceNumber, currentBalance]
+    );
+    
+    await client.query('COMMIT');
+    
+    const updatedWallet = await pool.query(
+      'SELECT main_balance, total_profit FROM wallets WHERE user_id = $1',
+      [userId]
+    );
+    
+    res.json({ 
+      success: true, 
+      betId: betResult.rows[0].id,
+      message: 'Bet placed successfully',
+      newBalance: updatedWallet.rows[0].main_balance,
+      newProfit: updatedWallet.rows[0].total_profit
+    });
+    
+  } catch (error) {
+    if (client) {
+      await client.query('ROLLBACK');
+      client.release();
+    }
+    console.error('❌ Bet error:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// Keep the old endpoint for backward compatibility
+app.post('/api/bets', authenticateToken, async (req, res) => {
+  req.url = '/api/bets/place';
+  return app.handle(req, res);
+});
+
+// Get settled bets for a user
+app.get('/api/bets/settlements/:userId', authenticateToken, async (req, res) => {
+  const { userId } = req.params;
+  
+  try {
+    const settlements = await pool.query(
+      `SELECT b.*, p.full_name
+       FROM bets b
+       JOIN profiles p ON b.user_id = p.id
+       WHERE b.user_id = $1 
+         AND b.status IN ('won', 'lost', 'cashed_out')
+         AND b.settled_at > NOW() - INTERVAL '24 hours'
+       ORDER BY b.settled_at DESC`,
+      [userId]
+    );
+    
+    const formattedSettlements = settlements.rows.map(bet => ({
+      id: bet.id,
+      stake: parseFloat(bet.stake),
+      potentialWinnings: parseFloat(bet.potential_winnings),
+      actualWinnings: parseFloat(bet.actual_winnings || 0),
+      profit: parseFloat(bet.profit || 0),
+      status: bet.status,
+      result: bet.status === 'won' || bet.status === 'cashed_out' ? 'won' : 'lost',
+      winnings: bet.actual_winnings || (bet.status === 'cashed_out' ? bet.potential_winnings : 0),
+      settledAt: bet.settled_at,
+      selections: bet.selections
+    }));
+    
+    res.json({
+      settlements: formattedSettlements,
+      count: formattedSettlements.length
+    });
+    
+  } catch (error) {
+    console.error('❌ Get settlements error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get jackpot matches for a specific week
+app.get('/api/jackpot/matches/:week', authenticateToken, async (req, res) => {
+  const { week } = req.params;
+  
+  try {
+    const matches = generateJackpotMatches(17);
+    
+    res.json({
+      week: parseInt(week),
+      matches,
+      totalPool: 1500000,
+      totalEntries: Math.floor(Math.random() * 200) + 50
+    });
+    
+  } catch (error) {
+    console.error('❌ Get jackpot matches error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Helper function to generate jackpot matches
+function generateJackpotMatches(count) {
+  const leagues = [
+    { id: 39, name: 'Premier League', country: 'England' },
+    { id: 140, name: 'La Liga', country: 'Spain' },
+    { id: 78, name: 'Bundesliga', country: 'Germany' },
+    { id: 135, name: 'Serie A', country: 'Italy' },
+    { id: 61, name: 'Ligue 1', country: 'France' },
+    { id: 2, name: 'Champions League', country: 'Europe' },
+  ];
+  
+  const teams = [
+    { home: 'Manchester City', away: 'Arsenal' },
+    { home: 'Liverpool', away: 'Chelsea' },
+    { home: 'Real Madrid', away: 'Barcelona' },
+    { home: 'Bayern Munich', away: 'Dortmund' },
+    { home: 'Inter Milan', away: 'AC Milan' },
+    { home: 'PSG', away: 'Marseille' },
+    { home: 'Tottenham', away: 'Manchester United' },
+    { home: 'Atletico Madrid', away: 'Sevilla' },
+    { home: 'RB Leipzig', away: 'Bayer Leverkusen' },
+    { home: 'Napoli', away: 'Juventus' },
+    { home: 'Ajax', away: 'PSV' },
+    { home: 'Benfica', away: 'Porto' },
+    { home: 'Celtic', away: 'Rangers' },
+    { home: 'Galatasaray', away: 'Fenerbahce' },
+    { home: 'Club Brugge', away: 'Anderlecht' },
+    { home: 'Shakhtar', away: 'Dynamo Kyiv' },
+    { home: 'Salzburg', away: 'Sturm Graz' },
+  ];
+  
+  const matches = [];
+  
+  for (let i = 0; i < count; i++) {
+    const league = leagues[i % leagues.length];
+    const teamPair = teams[i % teams.length];
+    const date = new Date();
+    date.setDate(date.getDate() + (i % 7) + 1);
+    date.setHours(15 + (i % 8), 0, 0, 0);
+    
+    const random = (min, max) => {
+      return Number((min + (i * 0.1) % (max - min)).toFixed(2));
+    };
+    
+    matches.push({
+      id: i + 1,
+      fixtureId: 100000 + i,
+      homeTeam: teamPair.home,
+      awayTeam: teamPair.away,
+      league: league.name,
+      leagueId: league.id,
+      country: league.country,
+      date: date.toISOString(),
+      timestamp: date.getTime(),
+      odds: {
+        home: random(1.5, 3.0),
+        draw: random(2.8, 4.0),
+        away: random(1.8, 3.5)
+      }
+    });
+  }
+  
+  return matches;
+}
+
+// Get user's jackpot entry for a specific week
+app.get('/api/jackpot/user/:userId/week/:week', authenticateToken, async (req, res) => {
+  const { userId, week } = req.params;
+  
+  try {
+    const result = await pool.query(
+      `SELECT * FROM jackpot_entries 
+       WHERE user_id = $1 AND EXTRACT(WEEK FROM created_at) = $2
+       ORDER BY created_at DESC LIMIT 1`,
+      [userId, week]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.json({ entry: null });
+    }
+    
+    const entry = result.rows[0];
+    
+    res.json({
+      entry: {
+        id: entry.id,
+        userId: entry.user_id,
+        weekNumber: parseInt(week),
+        stake: parseFloat(entry.stake),
+        matches: entry.numbers,
+        totalOdds: entry.stake * 500,
+        potentialWinnings: entry.stake * 500,
+        status: entry.status,
+        createdAt: entry.created_at
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Get user jackpot entry error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get jackpot leaderboard
+app.get('/api/jackpot/leaderboard/:week', authenticateToken, async (req, res) => {
+  const { week } = req.params;
+  
+  try {
+    const result = await pool.query(
+      `SELECT je.*, p.full_name, p.phone
+       FROM jackpot_entries je
+       JOIN profiles p ON je.user_id = p.id
+       WHERE EXTRACT(WEEK FROM je.created_at) = $1
+       ORDER BY je.stake DESC
+       LIMIT 20`,
+      [week]
+    );
+    
+    const entries = result.rows.map(entry => ({
+      id: entry.id,
+      userName: entry.full_name,
+      stake: parseFloat(entry.stake),
+      potentialWinnings: entry.stake * 500,
+      status: entry.status,
+      date: entry.created_at
+    }));
+    
+    res.json({ entries });
+    
+  } catch (error) {
+    console.error('❌ Get jackpot leaderboard error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==================== ADMIN AVIATOR CONTROLS ====================
 app.get('/api/admin/aviator/settings', authenticateAdmin, async (req, res) => {
   try {
@@ -4266,7 +5422,7 @@ app.put('/api/admin/aviator/settings', authenticateAdmin, async (req, res) => {
            max_bet = COALESCE($3, max_bet),
            house_edge = COALESCE($4, house_edge),
            provably_fair = COALESCE($5, provably_fair),
-           max_payout = COALESCE$6, max_payout),
+           max_payout = COALESCE($6, max_payout),
            auto_crash_enabled = COALESCE($7, auto_crash_enabled),
            auto_crash_multiplier = COALESCE($8, auto_crash_multiplier),
            updated_at = NOW(),
@@ -5148,9 +6304,9 @@ app.get('/api/debug/wallet/:userId', authenticateToken, async (req, res) => {
     
     const balanceCalc = await pool.query(
       `SELECT 
-          COALESCE(SUM(CASE WHEN type IN ('deposit', 'win', 'bonus') THEN amount ELSE 0 END), 0) as total_credits,
+          COALESCE(SUM(CASE WHEN type IN ('deposit', 'win', 'bonus', 'commission') THEN amount ELSE 0 END), 0) as total_credits,
           COALESCE(SUM(CASE WHEN type IN ('withdrawal', 'bet') THEN amount ELSE 0 END), 0) as total_debits,
-          COALESCE(SUM(CASE WHEN type IN ('deposit', 'win', 'bonus') THEN amount ELSE 0 END), 0) -
+          COALESCE(SUM(CASE WHEN type IN ('deposit', 'win', 'bonus', 'commission') THEN amount ELSE 0 END), 0) -
           COALESCE(SUM(CASE WHEN type IN ('withdrawal', 'bet') THEN amount ELSE 0 END), 0) as calculated_balance,
           COALESCE(SUM(profit), 0) as total_profit
       FROM transactions 
@@ -5239,6 +6395,14 @@ const server = app.listen(port, '0.0.0.0', () => {
   console.log(`   📞 GET  /api/support/contact`);
   console.log(`   📝 POST /api/support/feedback`);
   console.log(`   📊 GET  /api/support/stats`);
+  console.log(`   🤝 GET  /api/affiliate/stats/:userId`);
+  console.log(`   🤝 GET  /api/affiliate/referrals/:userId`);
+  console.log(`   🤝 POST /api/affiliate/withdraw`);
+  console.log(`   🤝 GET  /api/affiliate/commissions/:userId`);
+  console.log(`   🤝 POST /api/affiliate/generate-code`);
+  console.log(`   🤝 GET  /api/affiliate/validate/:code`);
+  console.log(`   🤝 GET  /api/affiliate/leaderboard`);
+  console.log(`   🤝 POST /api/affiliate/track`);
   console.log(`   👑 POST /api/admin/register-first`);
   console.log(`   👑 POST /api/admin/login`);
   console.log(`   👑 POST /api/admin/forgot-password`);
