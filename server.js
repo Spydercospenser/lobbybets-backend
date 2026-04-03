@@ -1239,7 +1239,7 @@ app.post('/api/register', async (req, res) => {
     
     const userId = userResult.rows[0].id;
     
-    // Create wallet with welcome bonus
+    // Create wallet with welcome bonus (ONLY ONCE)
     await client.query(
       `INSERT INTO wallets 
        (user_id, main_balance, lifetime_deposits, created_at, updated_at) 
@@ -1247,13 +1247,8 @@ app.post('/api/register', async (req, res) => {
       [userId]
     );
     
-    // Add transaction record for the welcome bonus
-    await client.query(
-  `INSERT INTO wallets 
-   (user_id, main_balance, lifetime_deposits, created_at, updated_at) 
-   VALUES ($1, 100, 100, NOW(), NOW())`,
-  [userId]  // Use existing userId, don't redeclare
-);
+    // REMOVED: Duplicate wallet creation
+    // The welcome bonus is handled by the database trigger, not manual insertion
     
     await client.query('COMMIT');
     
