@@ -1249,11 +1249,11 @@ app.post('/api/register', async (req, res) => {
     
     // Add transaction record for the welcome bonus
     await client.query(
-      `INSERT INTO transactions 
-       (user_id, type, amount, status, description, reference, balance_before, balance_after, created_at, profit)
-       VALUES ($1, 'bonus', 100, 'completed', 'Welcome Bonus', $2, 0, 100, NOW(), 100)`,
-      [userId, 'BONUS-' + Date.now()]
-    );
+  `INSERT INTO wallets 
+   (user_id, main_balance, lifetime_deposits, created_at, updated_at) 
+   VALUES ($1, 100, 100, NOW(), NOW())`,
+  [userId]  // Use existing userId, don't redeclare
+);
     
     await client.query('COMMIT');
     
