@@ -4823,7 +4823,7 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
 
 // ==================== FOOTBALL API PROXY ENDPOINTS ====================
 
-const FOOTBALL_API_KEY = '06fd9ad610ba7c51d947ecab06d4f87';
+const FOOTBALL_API_KEY = '06fd9ad610ba7c51d947ecab06d4f87f';
 const FOOTBALL_API_URL = 'https://v3.football.api-sports.io';
 
 // Test endpoint to check API status
